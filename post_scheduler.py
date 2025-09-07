@@ -30,7 +30,7 @@ import requests
 
 API_BASE = "https://api.x.com"
 OAUTH_TOKEN_URL = f"{API_BASE}/2/oauth2/token"
-MEDIA_UPLOAD_URL = f"{API_BASE}/2/media/upload"
+MEDIA_UPLOAD_URL = "https://upload.x.com/2/media/upload"  # <- esta es la que cambiamos
 MEDIA_METADATA_URL = f"{API_BASE}/2/media/metadata"
 TWEETS_URL = f"{API_BASE}/2/tweets"
 ME_URL = f"{API_BASE}/2/users/me"
@@ -184,40 +184,42 @@ def get_me(access_token: str) -> dict:
 
 
 def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str) -> str:
-    # INIT
-    init_data = {
+    # INIT (JSON)
+    h_json = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    init_payload = {
         "command": "INIT",
         "media_type": media_type,
-        "total_bytes": str(len(media_bytes)),
+        "total_bytes": len(media_bytes),
         "media_category": "tweet_image",
     }
-    r1 = requests.post(
-        MEDIA_UPLOAD_URL,
-        headers={"Authorization": f"Bearer {access_token}"},
-        data=init_data,
-        timeout=60,
-    )
-    j1 = r1.json()
+    r1 = requests.post(MEDIA_UPLOAD_URL, headers=h_json, json=init_payload, timeout=60)
+    try:
+        j1 = r1.json()
+    except Exception:
+        j1 = {"error": r1.text[:200]}
+    print("MEDIA INIT", r1.status_code, j1)
     if r1.status_code >= 400:
         raise RuntimeError(f"MEDIA INIT error: {j1}")
-    media_id = j1.get("data", {}).get("id") or j1.get("media_id_string") or j1.get("media_id")
+
+    media_id = (
+        j1.get("data", {}).get("id")
+        or j1.get("data", {}).get("media_id")
+        or j1.get("media_id_string")
+        or j1.get("media_id")
+    )
     if not media_id:
         raise RuntimeError(f"MEDIA INIT missing id: {j1}")
 
-    # APPEND (una sola parte)
-    files = {"media": ("upload", media_bytes, media_type)}
-    app_data = {
-        "command": "APPEND",
-        "media_id": str(media_id),
-        "segment_index": "0",
-    }
+    # APPEND (multipart con el binario; sin JSON)
+    files = {"media": ("chunk", media_bytes, media_type)}
     r2 = requests.post(
         MEDIA_UPLOAD_URL,
         headers={"Authorization": f"Bearer {access_token}"},
-        data=app_data,
+        params={"command": "APPEND", "media_id": str(media_id), "segment_index": "0"},
         files=files,
         timeout=120,
     )
+    print("MEDIA APPEND", r2.status_code)
     if r2.status_code >= 400:
         try:
             jj = r2.json()
@@ -225,19 +227,18 @@ def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str) -> s
             jj = {"error": r2.text[:200]}
         raise RuntimeError(f"MEDIA APPEND error: {jj}")
 
-    # FINALIZE
-    fin_data = {"command": "FINALIZE", "media_id": str(media_id)}
-    r3 = requests.post(
-        MEDIA_UPLOAD_URL,
-        headers={"Authorization": f"Bearer {access_token}"},
-        data=fin_data,
-        timeout=60,
-    )
-    j3 = r3.json()
+    # FINALIZE (JSON)
+    fin_payload = {"command": "FINALIZE", "media_id": str(media_id)}
+    r3 = requests.post(MEDIA_UPLOAD_URL, headers=h_json, json=fin_payload, timeout=60)
+    try:
+        j3 = r3.json()
+    except Exception:
+        j3 = {"error": r3.text[:200]}
+    print("MEDIA FINALIZE", r3.status_code, j3)
     if r3.status_code >= 400:
         raise RuntimeError(f"MEDIA FINALIZE error: {j3}")
 
-    # Si hay procesamiento (videos/gifs), poll STATUS. Para imágenes normalmente no aparece.
+    # Poll de procesamiento si lo informa (para imágenes casi nunca)
     proc = j3.get("data", {}).get("processing_info") or j3.get("processing_info")
     if proc:
         state = proc.get("state")
@@ -249,10 +250,12 @@ def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str) -> s
                 params={"command": "STATUS", "media_id": str(media_id)},
                 timeout=30,
             ).json()
+            print("MEDIA STATUS", st)
             proc = st.get("data", {}).get("processing_info") or st.get("processing_info") or {}
             state = proc.get("state")
             if state == "failed":
                 raise RuntimeError(f"MEDIA STATUS failed: {st}")
+
     return str(media_id)
 
 
