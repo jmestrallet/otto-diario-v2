@@ -1,0 +1,26 @@
+name: main
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests
+      - run: python post_scheduler.py
+        env:
+          X_CLIENT_ID: ${{ secrets.X_CLIENT_ID }}
+          REFRESH_TOKEN_ACC1: ${{ secrets.REFRESH_TOKEN_ACC1 }}
+          REFRESH_TOKEN_ACC2: ${{ secrets.REFRESH_TOKEN_ACC2 }}
+          REFRESH_TOKEN_ACC3: ${{ secrets.REFRESH_TOKEN_ACC3 }}
+          ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
+          CSV_FILE: calendar.csv
+          STATE_FILE: posted.csv
+          WINDOW_MIN: '5'
