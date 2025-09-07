@@ -1,1 +1,0 @@
-# otto-diario-v2
