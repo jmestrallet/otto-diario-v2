@@ -30,10 +30,16 @@ import requests
 
 API_BASE = "https://api.x.com"
 OAUTH_TOKEN_URL = f"{API_BASE}/2/oauth2/token"
-MEDIA_UPLOAD_URL = "https://upload.x.com/2/media/upload"  # <- esta es la que cambiamos
+
+MEDIA_INIT_URL = f"{API_BASE}/2/media/upload/initialize"
+MEDIA_APPEND_URL = f"{API_BASE}/2/media/upload/{{id}}/append"
+MEDIA_FINALIZE_URL = f"{API_BASE}/2/media/upload/{{id}}/finalize"
+MEDIA_STATUS_URL = f"{API_BASE}/2/media/upload"  # GET ?command=STATUS&media_id=...
+
 MEDIA_METADATA_URL = f"{API_BASE}/2/media/metadata"
 TWEETS_URL = f"{API_BASE}/2/tweets"
 ME_URL = f"{API_BASE}/2/users/me"
+
 
 MVD_TZ = ZoneInfo("America/Montevideo")
 
@@ -187,12 +193,11 @@ def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str) -> s
     # INIT (JSON)
     h_json = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
     init_payload = {
-        "command": "INIT",
         "media_type": media_type,
         "total_bytes": len(media_bytes),
         "media_category": "tweet_image",
     }
-    r1 = requests.post(MEDIA_UPLOAD_URL, headers=h_json, json=init_payload, timeout=60)
+    r1 = requests.post(MEDIA_INIT_URL, headers=h_json, json=init_payload, timeout=60)
     try:
         j1 = r1.json()
     except Exception:
@@ -203,19 +208,18 @@ def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str) -> s
 
     media_id = (
         j1.get("data", {}).get("id")
-        or j1.get("data", {}).get("media_id")
         or j1.get("media_id_string")
         or j1.get("media_id")
     )
     if not media_id:
         raise RuntimeError(f"MEDIA INIT missing id: {j1}")
 
-    # APPEND (multipart con el binario; sin JSON)
+    # APPEND (multipart con el binario; 1 solo segmento)
     files = {"media": ("chunk", media_bytes, media_type)}
     r2 = requests.post(
-        MEDIA_UPLOAD_URL,
+        MEDIA_APPEND_URL.format(id=media_id),
         headers={"Authorization": f"Bearer {access_token}"},
-        params={"command": "APPEND", "media_id": str(media_id), "segment_index": "0"},
+        data={"segment_index": "0"},
         files=files,
         timeout=120,
     )
@@ -227,9 +231,12 @@ def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str) -> s
             jj = {"error": r2.text[:200]}
         raise RuntimeError(f"MEDIA APPEND error: {jj}")
 
-    # FINALIZE (JSON)
-    fin_payload = {"command": "FINALIZE", "media_id": str(media_id)}
-    r3 = requests.post(MEDIA_UPLOAD_URL, headers=h_json, json=fin_payload, timeout=60)
+    # FINALIZE (sin body)
+    r3 = requests.post(
+        MEDIA_FINALIZE_URL.format(id=media_id),
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=60,
+    )
     try:
         j3 = r3.json()
     except Exception:
@@ -238,14 +245,14 @@ def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str) -> s
     if r3.status_code >= 400:
         raise RuntimeError(f"MEDIA FINALIZE error: {j3}")
 
-    # Poll de procesamiento si lo informa (para imágenes casi nunca)
+    # STATUS si reporta processing_info
     proc = j3.get("data", {}).get("processing_info") or j3.get("processing_info")
     if proc:
         state = proc.get("state")
         while state in ("pending", "in_progress"):
             time.sleep(int(proc.get("check_after_secs", 1)))
             st = requests.get(
-                MEDIA_UPLOAD_URL,
+                MEDIA_STATUS_URL,
                 headers={"Authorization": f"Bearer {access_token}"},
                 params={"command": "STATUS", "media_id": str(media_id)},
                 timeout=30,
@@ -257,7 +264,6 @@ def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str) -> s
                 raise RuntimeError(f"MEDIA STATUS failed: {st}")
 
     return str(media_id)
-
 
 def set_media_alt_text(access_token: str, media_id: str, alt_text: str) -> None:
     if not alt_text:
