@@ -5,6 +5,10 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+  actions: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -26,12 +30,46 @@ jobs:
       - name: Run scheduler
         env:
           X_CLIENT_ID: ${{ secrets.X_CLIENT_ID }}
-          REFRESH_TOKEN_ACC1: ${{ secrets.REFRESH_TOKEN_ACC1 }}
-          REFRESH_TOKEN_ACC2: ${{ secrets.REFRESH_TOKEN_ACC2 }}
-          REFRESH_TOKEN_ACC3: ${{ secrets.REFRESH_TOKEN_ACC3 }}
+          # Usamos la VARIABLE (rotativa). Si no existe, podrías caer al secret manualmente.
+          REFRESH_TOKEN_ACC1: ${{ vars.REFRESH_TOKEN_ACC1 }}
+          REFRESH_TOKEN_ACC2: ${{ vars.REFRESH_TOKEN_ACC2 }}
+          REFRESH_TOKEN_ACC3: ${{ vars.REFRESH_TOKEN_ACC3 }}
           ACCOUNTS_JSON: ${{ vars.ACCOUNTS_JSON }}
           CSV_FILE: ${{ vars.CSV_FILE }}
           STATE_FILE: ${{ vars.STATE_FILE }}
           WINDOW_MIN: ${{ vars.WINDOW_MIN }}
         run: |
           python post_scheduler.py
+
+      - name: Propagar refresh tokens rotativos a Variables
+        if: ${{ always() }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = '.tokens_out.json';
+            if (!fs.existsSync(path)) {
+              core.info('No hay tokens nuevos.');
+              return;
+            }
+            const data = JSON.parse(fs.readFileSync(path, 'utf8'));
+            for (const [acc, token] of Object.entries(data)) {
+              const name = `REFRESH_TOKEN_${acc}`;
+              core.info(`Actualizando variable ${name}`);
+              // intenta PATCH; si no existe, hace POST
+              try {
+                await github.request('PATCH /repos/{owner}/{repo}/actions/variables/{name}', {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name,
+                  value: token
+                });
+              } catch (e) {
+                await github.request('POST /repos/{owner}/{repo}/actions/variables', {
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name,
+                  value: token
+                });
+              }
+            }
