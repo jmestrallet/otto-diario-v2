@@ -302,8 +302,8 @@ def main() -> None:
 
     for idx, acc in enumerate(accounts):
         if idx:
-        time.sleep(3)  # pequeña pausa entre cuentas (2–5s está bien)
-        print(f"\n=== {acc.key} ({acc.lang}) ===")
+            time.sleep(3)  # pequeña pausa entre cuentas (2–5s está bien)
+            print(f"\n=== {acc.key} ({acc.lang}) ===")
         try:
             tok = refresh_access_token(client_id, acc.refresh_token)
             access_token = tok["access_token"]
