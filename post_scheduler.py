@@ -223,18 +223,45 @@ def set_media_alt_text(access_token: str, media_id: str, alt_text: str) -> None:
         try: print(f"ALT WARN: {r.status_code} {r.json()}")
         except Exception: print(f"ALT WARN: {r.status_code} {r.text[:200]}")
 
-def post_tweet_v2(access_token: str, text: str, media_id: Optional[str] = None, reply_to: Optional[str] = None) -> dict:
+def post_tweet_v2(access_token: str, text: str, media_id: Optional[str] = None,
+                  reply_to: Optional[str] = None, max_retries: int = 3) -> dict:
     body: Dict = {"text": text}
     if media_id:
-        body["media"] = {"media_ids":[str(media_id)]}
+        body["media"] = {"media_ids": [str(media_id)]}
     if reply_to:
         body["reply"] = {"in_reply_to_tweet_id": str(reply_to)}
-    r = requests.post(TWEETS_URL,
-                      headers={"Authorization": f"Bearer {access_token}","Content-Type":"application/json"},
-                      json=body, timeout=30)
-    j = r.json()
-    if r.status_code >= 400: raise RuntimeError(f"/2/tweets error: {j}")
-    return j
+
+    last = None
+    for attempt in range(1, max_retries + 1):
+        r = requests.post(
+            TWEETS_URL,
+            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+            json=body, timeout=30
+        )
+        ctype = r.headers.get("content-type", "")
+        try:
+            j = r.json() if ctype.startswith("application/json") else {"raw": r.text[:200]}
+        except Exception:
+            j = {"raw": r.text[:200]}
+
+        if r.status_code == 429 or r.status_code >= 500:
+            reset = r.headers.get("x-rate-limit-reset")
+            if reset:
+                import time
+                wait = max(5, int(reset) - int(time.time()))
+            else:
+                wait = min(60, 5 * (2 ** (attempt - 1)))
+            print(f"/2/tweets {r.status_code} -> retry {attempt}/{max_retries} en {wait}s ; resp={j}")
+            time.sleep(wait)
+            last = j
+            continue
+
+        if r.status_code >= 400:
+            raise RuntimeError(f"/2/tweets error: {j}")
+
+        return j
+
+    raise RuntimeError(f"/2/tweets retry exhausted: {last}")
 
 def load_threads(path: str) -> dict:
     try:
@@ -273,7 +300,9 @@ def main() -> None:
 
     threads = load_threads(THREAD_FILE)
 
-    for acc in accounts:
+    for idx, acc in enumerate(accounts):
+        if idx:
+        time.sleep(3)  # pequeña pausa entre cuentas (2–5s está bien)
         print(f"\n=== {acc.key} ({acc.lang}) ===")
         try:
             tok = refresh_access_token(client_id, acc.refresh_token)
