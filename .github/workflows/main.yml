@@ -30,10 +30,10 @@ jobs:
       - name: Run scheduler
         env:
           X_CLIENT_ID: ${{ secrets.X_CLIENT_ID }}
-          # Usamos la VARIABLE (rotativa). Si no existe, podrías caer al secret manualmente.
-          REFRESH_TOKEN_ACC1: ${{ vars.REFRESH_TOKEN_ACC1 }}
-          REFRESH_TOKEN_ACC2: ${{ vars.REFRESH_TOKEN_ACC2 }}
-          REFRESH_TOKEN_ACC3: ${{ vars.REFRESH_TOKEN_ACC3 }}
+          # Variable primero; si no existe, cae al Secret
+          REFRESH_TOKEN_ACC1: ${{ vars.REFRESH_TOKEN_ACC1 || secrets.REFRESH_TOKEN_ACC1 }}
+          REFRESH_TOKEN_ACC2: ${{ vars.REFRESH_TOKEN_ACC2 || secrets.REFRESH_TOKEN_ACC2 }}
+          REFRESH_TOKEN_ACC3: ${{ vars.REFRESH_TOKEN_ACC3 || secrets.REFRESH_TOKEN_ACC3 }}
           ACCOUNTS_JSON: ${{ vars.ACCOUNTS_JSON }}
           CSV_FILE: ${{ vars.CSV_FILE }}
           STATE_FILE: ${{ vars.STATE_FILE }}
@@ -41,10 +41,20 @@ jobs:
         run: |
           python post_scheduler.py
 
+      - name: Subir artefacto con tokens rotados (backup)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: new-refresh-tokens
+          path: .tokens_out.json
+          if-no-files-found: ignore
+          retention-days: 1
+
       - name: Propagar refresh tokens rotativos a Variables
-        if: ${{ always() }}
+        if: always()
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.GH_VAR_TOKEN }}
           script: |
             const fs = require('fs');
             const path = '.tokens_out.json';
@@ -56,7 +66,6 @@ jobs:
             for (const [acc, token] of Object.entries(data)) {
               const name = `REFRESH_TOKEN_${acc}`;
               core.info(`Actualizando variable ${name}`);
-              // intenta PATCH; si no existe, hace POST
               try {
                 await github.request('PATCH /repos/{owner}/{repo}/actions/variables/{name}', {
                   owner: context.repo.owner,
