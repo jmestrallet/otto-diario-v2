@@ -30,9 +30,9 @@ ME_URL = f"{API_BASE}/2/users/me"
 MVD_TZ = ZoneInfo("America/Montevideo")
 
 # --- Telegram ---
-TG_TOKEN = env("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT_ID = env("TELEGRAM_CHAT_ID", "")
-TG_NOTIFY = (env("TELEGRAM_NOTIFY", "success,fail") or "").lower()
+TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TG_NOTIFY = (os.getenv("TELEGRAM_NOTIFY", "success,fail") or "").lower()
 
 def tg(text: str):
     if not TG_TOKEN or not TG_CHAT_ID:
@@ -50,6 +50,7 @@ def tg(text: str):
         )
     except Exception as e:
         print("TG ERROR", e)
+
 
 # Archivo de hilos (persistente en repo)
 def env(name: str, default: Optional[str] = None) -> str:
