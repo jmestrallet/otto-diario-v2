@@ -4,6 +4,17 @@
 from __future__ import annotations
 
 import csv, json, os, sys, time, mimetypes, requests
+import re, hashlib
+
+def _norm_text(t: str) -> str:
+    t = (t or "").strip()
+    return re.sub(r"\s+", " ", t)  # colapsa espacios y saltos de línea
+
+def dedupe_key_for(acc_lang: str, text: str) -> str:
+    # No depende de fecha/hora ni de la imagen. "mismo texto" => misma clave.
+    base = f"{acc_lang}|{_norm_text(text)}"
+    return "v2:" + hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
+    
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -62,23 +73,28 @@ def in_window(when_utc: datetime, window_min: int) -> bool:
     return (n - timedelta(minutes=window_min)) <= when_utc <= n
 
 def unique_row_key(row: dict) -> str:
+    # Solo para compatibilidad con posted.csv antiguo (no usado para dedupe real)
     return f"{row['fecha']}_{row['hora_MVD']}_{row['texto_es'][:20]}"
 
-def read_posted(state_file: str) -> set[Tuple[str, str]]:
-    s: set[Tuple[str,str]] = set()
+def read_posted(state_file: str) -> set[tuple[str, str]]:
+    s: set[tuple[str, str]] = set()
     if os.path.exists(state_file):
         with open(state_file, "r", encoding="utf-8", newline="") as f:
-            for r in csv.DictReader(f):
-                s.add((r.get("key",""), r.get("account","")))
+            r = csv.DictReader(f)
+            for row in r:
+                k = row.get("dedupe_key") or row.get("key") or ""
+                s.add((k, row.get("account", "")))
     return s
 
-def append_posted(state_file: str, key: str, account: str, tweet_id: str) -> None:
+
+def append_posted(state_file: str, dedupe_key: str, account: str, tweet_id: str, text_preview: str) -> None:
     exists = os.path.exists(state_file)
     with open(state_file, "a", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         if not exists:
-            w.writerow(["key","account","posted_at_utc","tweet_id"])
-        w.writerow([key, account, datetime.now(timezone.utc).isoformat(), tweet_id])
+            w.writerow(["dedupe_key", "account", "posted_at_utc", "tweet_id", "text_preview"])
+        w.writerow([dedupe_key, account, datetime.now(timezone.utc).isoformat(), tweet_id, text_preview[:60]])
+
 
 def detect_mime(path_or_url: str, content_bytes: Optional[bytes]) -> str:
     parsed = urlparse(path_or_url)
@@ -230,38 +246,45 @@ def main() -> None:
         except Exception as e:
             print(f"AUTH ERROR {acc.key}: {e}"); continue
 
-        for row in rows:
+               for row in rows:
             try:
                 wutc = when_utc_from_row(row["fecha"], row["hora_MVD"])
             except Exception as e:
-                print(f"ROW TIME ERROR: {e} -> {row}"); continue
+                print(f"ROW TIME ERROR: {e} -> {row}")
+                continue
 
-            if not in_window(wutc, window_min): continue
+            if not in_window(wutc, window_min):
+                continue
 
-            row_key = unique_row_key(row)
-            if (row_key, acc.key) in posted: continue
-
+            # Texto según idioma de la cuenta
             txt_key, alt_key = f"texto_{acc.lang}", f"alt_{acc.lang}"
             text = (row.get(txt_key) or "").strip()
             if not text:
-                print(f"SKIP (texto vacío) {row_key}"); continue
+                continue
 
+            # DEDUPE GLOBAL por texto (por cuenta/idioma)
+            dedupe_key = dedupe_key_for(acc.lang, text)
+            if (dedupe_key, acc.key) in posted:
+                print(f"SKIP (dedupe) {dedupe_key} ya publicado por {acc.key}")
+                continue
+
+            # Imagen (opcional)
             media_id = None
             img = (row.get("imagen") or "").strip()
             if img:
                 try:
                     b, mime = get_bytes(img)
                     media_id = upload_media_v2(access_token, b, mime)
-                    set_media_alt_text(access_token, media_id, row.get(alt_key,""))
+                    set_media_alt_text(access_token, media_id, row.get(alt_key, ""))
                 except Exception as e:
                     print(f"MEDIA ERROR -> solo texto: {e}")
 
             try:
                 resp = post_tweet_v2(access_token, text, media_id)
-                tweet_id = resp.get("data",{}).get("id")
-                print(f"publicado (oauth2) {acc.key}: tweet_id={tweet_id} cuando_utc={wutc.isoformat()} key={row_key}")
-                append_posted(state_file, row_key, acc.key, tweet_id or "")
-                posted.add((row_key, acc.key))
+                tweet_id = resp.get("data", {}).get("id")
+                print(f"publicado (oauth2) {acc.key}: tweet_id={tweet_id} cuando_utc={wutc.isoformat()}")
+                append_posted(state_file, dedupe_key, acc.key, tweet_id or "", text)
+                posted.add((dedupe_key, acc.key))
             except Exception as e:
                 print(f"TWEET ERROR {acc.key}: {e}")
 
