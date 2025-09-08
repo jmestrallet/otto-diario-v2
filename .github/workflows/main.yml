@@ -9,6 +9,10 @@ permissions:
   contents: write
   actions: write
 
+concurrency:
+  group: otto-diario-scheduler
+  cancel-in-progress: true
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -49,6 +53,20 @@ jobs:
           path: .tokens_out.json
           if-no-files-found: ignore
           retention-days: 1
+
+      - name: Commit posted.csv (persist state)
+        if: always()
+        run: |
+          if [ -f "posted.csv" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git fetch origin
+            git checkout $GITHUB_REF_NAME || true
+            git pull --rebase origin $GITHUB_REF_NAME || true
+            git add posted.csv
+            git commit -m "chore: update posted.csv [skip ci]" || echo "No changes"
+            git push || echo "No push needed"
+          fi
 
       - name: Propagar refresh tokens rotativos a Variables
         if: always()
