@@ -1,10 +1,11 @@
+# post_scheduler.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
 
 import csv, json, os, sys, time, mimetypes, requests
-import re, hashlib
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -29,16 +30,34 @@ ME_URL = f"{API_BASE}/2/users/me"
 
 MVD_TZ = ZoneInfo("America/Montevideo")
 
-# --- Telegram ---
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-TG_NOTIFY = (os.getenv("TELEGRAM_NOTIFY", "success,fail") or "").lower()
+# ==========================
+# Helpers de entorno y presupuesto de tiempo
+# ==========================
+def env(name: str, default: Optional[str] = None) -> str:
+    v = os.getenv(name)
+    return default if v in (None, "") else v
+
+THREAD_FILE = env("THREAD_FILE", "threads.json")
+
+# Presupuesto de tiempo para evitar timeouts del job
+MAX_RUN_SECONDS = int(env("MAX_RUN_SECONDS", "420"))            # ~7 min
+MAX_TWEETS_PER_ACCOUNT = int(env("MAX_TWEETS_PER_ACCOUNT", "3"))
+_START_MONO = time.monotonic()
+def time_left() -> int:
+    return max(0, int(_START_MONO + MAX_RUN_SECONDS - time.monotonic()))
+
+# ==========================
+# Telegram
+# ==========================
+TG_TOKEN = env("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID = env("TELEGRAM_CHAT_ID", "")
+TG_NOTIFY = (env("TELEGRAM_NOTIFY", "success,fail") or "").lower()
 
 def tg(text: str):
     if not TG_TOKEN or not TG_CHAT_ID:
         return
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             json={
                 "chat_id": TG_CHAT_ID,
@@ -48,16 +67,9 @@ def tg(text: str):
             },
             timeout=15,
         )
+        print("TG STATUS:", r.status_code)
     except Exception as e:
         print("TG ERROR", e)
-
-
-# Archivo de hilos (persistente en repo)
-def env(name: str, default: Optional[str] = None) -> str:
-    v = os.getenv(name)
-    return default if v in (None, "") else v
-
-THREAD_FILE = env("THREAD_FILE", "threads.json")
 
 # ==========================
 # Utilidades
@@ -199,12 +211,16 @@ def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str) -> s
     print("MEDIA FINALIZE", r3.status_code, j3)
     if r3.status_code >= 400: raise RuntimeError(f"MEDIA FINALIZE error: {j3}")
 
-    # STATUS si corresponde
+    # STATUS si corresponde (cap de presupuesto)
     proc = j3.get("data", {}).get("processing_info") or j3.get("processing_info")
     if proc:
         state = proc.get("state")
         while state in ("pending","in_progress"):
-            time.sleep(int(proc.get("check_after_secs",1)))
+            sleep_s = min(int(proc.get("check_after_secs", 1)), 5, time_left())
+            if sleep_s <= 0:
+                raise RuntimeError("MEDIA STATUS timeout (presupuesto agotado)")
+            time.sleep(sleep_s)
+
             st = requests.get(MEDIA_STATUS_URL, headers={"Authorization": f"Bearer {access_token}"},
                               params={"command":"STATUS","media_id":str(media_id)}, timeout=30).json()
             print("MEDIA STATUS", st)
@@ -250,6 +266,10 @@ def post_tweet_v2(access_token: str, text: str, media_id: Optional[str] = None,
                 wait = max(5, int(reset) - int(time.time()))
             else:
                 wait = min(60, 5 * (2 ** (attempt - 1)))
+            # cap por presupuesto global
+            wait = min(wait, 20, time_left())
+            if wait <= 0:
+                raise RuntimeError(f"/2/tweets backoff excede presupuesto; resp={j}")
             print(f"/2/tweets {r.status_code} -> retry {attempt}/{max_retries} en {wait}s ; resp={j}")
             time.sleep(wait)
             last = j
@@ -317,7 +337,13 @@ def main() -> None:
             print(f"AUTH ERROR {acc.key}: {e}")
             continue
 
+        posted_count = 0
+
         for row in rows:
+            if time_left() < 5:
+                print("TIME BUDGET agotado; se corta este run.")
+                break
+
             try:
                 wutc = when_utc_from_row(row["fecha"], row["hora_MVD"])
             except Exception as e:
@@ -356,7 +382,7 @@ def main() -> None:
                     if "fail" in TG_NOTIFY:
                         tg(f"⚠️ <b>{acc.key} ({acc.lang})</b> media falló {row['fecha']} {row['hora_MVD']}\n<code>{str(e)[:250]}</code>")
 
-            # Post con retries/backoff (tu post_tweet_v2 ya actualizado)
+            # Post con retries/backoff
             try:
                 resp = post_tweet_v2(access_token, text, media_id, reply_to=reply_to_id)
                 tweet_id = resp.get("data", {}).get("id")
@@ -373,13 +399,16 @@ def main() -> None:
                     threads[f"{acc.key}:{thread_key}"] = tweet_id
                 append_posted(state_file, dedupe_key, acc.key, tweet_id or "", text)
                 posted.add((dedupe_key, acc.key))
+                posted_count += 1
+                if posted_count >= MAX_TWEETS_PER_ACCOUNT:
+                    print(f"Limite por cuenta alcanzado ({MAX_TWEETS_PER_ACCOUNT}); paso a la siguiente cuenta.")
+                    break
             except Exception as e:
                 print(f"TWEET ERROR {acc.key}: {e}")
                 if "fail" in TG_NOTIFY:
                     tg(f"❌ <b>{acc.key} ({acc.lang})</b> publicación falló {row['fecha']} {row['hora_MVD']}\n<code>{str(e)[:300]}</code>")
 
     save_threads(THREAD_FILE, threads)
-
 
 if __name__ == "__main__":
     main()
