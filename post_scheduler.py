@@ -247,7 +247,6 @@ def post_tweet_v2(access_token: str, text: str, media_id: Optional[str] = None,
         if r.status_code == 429 or r.status_code >= 500:
             reset = r.headers.get("x-rate-limit-reset")
             if reset:
-                import time
                 wait = max(5, int(reset) - int(time.time()))
             else:
                 wait = min(60, 5 * (2 ** (attempt - 1)))
@@ -318,7 +317,6 @@ def main() -> None:
             print(f"AUTH ERROR {acc.key}: {e}")
             continue
 
-        # >>> ESTE for va fuera del except, al mismo nivel que el try <<<
         for row in rows:
             try:
                 wutc = when_utc_from_row(row["fecha"], row["hora_MVD"])
