@@ -37,19 +37,14 @@ jobs:
           pip install requests
           npm i tweetsodium
 
-      - name: (Opcional) Mask tokens si vienen por Variables
-        run: |
-          echo "::add-mask::${{ vars.REFRESH_TOKEN_ACC1 }}"
-          echo "::add-mask::${{ vars.REFRESH_TOKEN_ACC2 }}"
-          echo "::add-mask::${{ vars.REFRESH_TOKEN_ACC3 }}"
-
       - name: Run scheduler
         env:
           X_CLIENT_ID: ${{ secrets.X_CLIENT_ID }}
           # Seguridad: leer de Secrets; si faltan, cae a Variables (solo para el primer run).
-          REFRESH_TOKEN_ACC1: ${{ secrets.REFRESH_TOKEN_ACC1 || vars.REFRESH_TOKEN_ACC1 }}
-          REFRESH_TOKEN_ACC2: ${{ secrets.REFRESH_TOKEN_ACC2 || vars.REFRESH_TOKEN_ACC2 }}
-          REFRESH_TOKEN_ACC3: ${{ secrets.REFRESH_TOKEN_ACC3 || vars.REFRESH_TOKEN_ACC3 }}
+          REFRESH_TOKEN_ACC1: ${{ secrets.REFRESH_TOKEN_ACC1 }}
+          REFRESH_TOKEN_ACC2: ${{ secrets.REFRESH_TOKEN_ACC2 }}
+          REFRESH_TOKEN_ACC3: ${{ secrets.REFRESH_TOKEN_ACC3 }}
+
           ACCOUNTS_JSON: ${{ vars.ACCOUNTS_JSON }}
           CSV_FILE: ${{ vars.CSV_FILE }}
           STATE_FILE: ${{ vars.STATE_FILE }}
