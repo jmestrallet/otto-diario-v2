@@ -74,7 +74,7 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git fetch origin
             git checkout $GITHUB_REF_NAME || true
-            git pull --rebase origin $GITHUB_REF_NAME || true
+            git pull --rebase --autostash origin $GITHUB_REF_NAME || true
             git add posted.csv
             git commit -m "chore: update posted.csv [skip ci]" || echo "No changes"
             git push || echo "No push needed"
