@@ -300,28 +300,33 @@ def main() -> None:
 
     threads = load_threads(THREAD_FILE)
 
+    # Pausa breve entre cuentas para evitar golpear el endpoint a la vez
     for idx, acc in enumerate(accounts):
         if idx:
-            time.sleep(3)  # pequeña pausa entre cuentas (2–5s está bien)
-            print(f"\n=== {acc.key} ({acc.lang}) ===")
+            time.sleep(3)  # 2–5s está bien
+
+        print(f"\n=== {acc.key} ({acc.lang}) ===")
         try:
             tok = refresh_access_token(client_id, acc.refresh_token)
             access_token = tok["access_token"]
-            new_rt = tok.get("refresh_token","")
+            new_rt = tok.get("refresh_token", "")
             if new_rt and new_rt != acc.refresh_token:
                 # guarda para que el workflow lo rote en Secrets
                 save_rotating_token(acc.key, new_rt)
             _ = get_me(access_token)
         except Exception as e:
-            print(f"AUTH ERROR {acc.key}: {e}"); continue
+            print(f"AUTH ERROR {acc.key}: {e}")
+            continue
 
+        # >>> ESTE for va fuera del except, al mismo nivel que el try <<<
         for row in rows:
             try:
                 wutc = when_utc_from_row(row["fecha"], row["hora_MVD"])
             except Exception as e:
-                print(f"ROW TIME ERROR: {e} -> {row}"); continue
+                print(f"ROW TIME ERROR: {e} -> {row}")
+                continue
 
-            if not in_window(wutc, window_min): 
+            if not in_window(wutc, window_min):
                 continue
 
             # Texto según idioma
@@ -336,7 +341,7 @@ def main() -> None:
                 print(f"SKIP (dedupe-ts) {dedupe_key} ya publicado por {acc.key}")
                 continue
 
-            # Reply al hilo (si hay thread=...)
+            # Responder a hilo si hay 'thread'
             thread_key = (row.get("thread") or "").strip()
             reply_to_id = threads.get(f"{acc.key}:{thread_key}") if thread_key else None
 
@@ -347,13 +352,13 @@ def main() -> None:
                 try:
                     b, mime = get_bytes(img)
                     media_id = upload_media_v2(access_token, b, mime)
-                    set_media_alt_text(access_token, media_id, row.get(alt_key,""))
+                    set_media_alt_text(access_token, media_id, row.get(alt_key, ""))
                 except Exception as e:
                     print(f"MEDIA ERROR -> solo texto: {e}")
                     if "fail" in TG_NOTIFY:
                         tg(f"⚠️ <b>{acc.key} ({acc.lang})</b> media falló {row['fecha']} {row['hora_MVD']}\n<code>{str(e)[:250]}</code>")
 
-
+            # Post con retries/backoff (tu post_tweet_v2 ya actualizado)
             try:
                 resp = post_tweet_v2(access_token, text, media_id, reply_to=reply_to_id)
                 tweet_id = resp.get("data", {}).get("id")
@@ -375,8 +380,8 @@ def main() -> None:
                 if "fail" in TG_NOTIFY:
                     tg(f"❌ <b>{acc.key} ({acc.lang})</b> publicación falló {row['fecha']} {row['hora_MVD']}\n<code>{str(e)[:300]}</code>")
 
-
     save_threads(THREAD_FILE, threads)
+
 
 if __name__ == "__main__":
     main()
