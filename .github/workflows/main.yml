@@ -61,17 +61,20 @@ jobs:
           if-no-files-found: ignore
           retention-days: 1
 
-      - name: Commit posted.csv (persist state)
+      - name: Commit posted.csv y threads.json (persist state)
         if: always()
         run: |
-          if [ -f "posted.csv" ]; then
+          CHANGED=0
+          if [ -f "posted.csv" ]; then CHANGED=1; fi
+          if [ -f "threads.json" ]; then CHANGED=1; fi
+          if [ "$CHANGED" = "1" ]; then
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git fetch origin
             git checkout $GITHUB_REF_NAME || true
             git pull --rebase --autostash origin $GITHUB_REF_NAME || true
-            git add posted.csv
-            git commit -m "chore: update posted.csv [skip ci]" || echo "No changes"
+            git add posted.csv threads.json
+            git commit -m "chore: update state files [skip ci]" || echo "No changes"
             git push || echo "No push needed"
           fi
 
