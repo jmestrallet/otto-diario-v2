@@ -246,7 +246,7 @@ def main() -> None:
         except Exception as e:
             print(f"AUTH ERROR {acc.key}: {e}"); continue
 
-               for row in rows:
+        for row in rows:
             try:
                 wutc = when_utc_from_row(row["fecha"], row["hora_MVD"])
             except Exception as e:
