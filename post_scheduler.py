@@ -29,6 +29,28 @@ ME_URL = f"{API_BASE}/2/users/me"
 
 MVD_TZ = ZoneInfo("America/Montevideo")
 
+# --- Telegram ---
+TG_TOKEN = env("TELEGRAM_BOT_TOKEN", "")
+TG_CHAT_ID = env("TELEGRAM_CHAT_ID", "")
+TG_NOTIFY = (env("TELEGRAM_NOTIFY", "success,fail") or "").lower()
+
+def tg(text: str):
+    if not TG_TOKEN or not TG_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+            json={
+                "chat_id": TG_CHAT_ID,
+                "text": text[:4000],
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            },
+            timeout=15,
+        )
+    except Exception as e:
+        print("TG ERROR", e)
+
 # Archivo de hilos (persistente en repo)
 def env(name: str, default: Optional[str] = None) -> str:
     v = os.getenv(name)
@@ -298,17 +320,31 @@ def main() -> None:
                     set_media_alt_text(access_token, media_id, row.get(alt_key,""))
                 except Exception as e:
                     print(f"MEDIA ERROR -> solo texto: {e}")
+                    if "fail" in TG_NOTIFY:
+                        tg(f"⚠️ <b>{acc.key} ({acc.lang})</b> media falló {row['fecha']} {row['hora_MVD']}\n<code>{str(e)[:250]}</code>")
+
 
             try:
                 resp = post_tweet_v2(access_token, text, media_id, reply_to=reply_to_id)
-                tweet_id = resp.get("data",{}).get("id")
+                tweet_id = resp.get("data", {}).get("id")
                 print(f"publicado (oauth2) {acc.key}: tweet_id={tweet_id} cuando_utc={wutc.isoformat()}")
+                if "success" in TG_NOTIFY and tweet_id:
+                    preview = (text[:180] + "…") if len(text) > 180 else text
+                    tg(
+                        f"✅ <b>{acc.key} ({acc.lang})</b>\n"
+                        f"<b>{row['fecha']} {row['hora_MVD']}</b>\n"
+                        f"{preview}\n"
+                        f"<a href=\"https://x.com/i/web/status/{tweet_id}\">ver en X</a>"
+                    )
                 if thread_key and tweet_id:
                     threads[f"{acc.key}:{thread_key}"] = tweet_id
                 append_posted(state_file, dedupe_key, acc.key, tweet_id or "", text)
                 posted.add((dedupe_key, acc.key))
             except Exception as e:
                 print(f"TWEET ERROR {acc.key}: {e}")
+                if "fail" in TG_NOTIFY:
+                    tg(f"❌ <b>{acc.key} ({acc.lang})</b> publicación falló {row['fecha']} {row['hora_MVD']}\n<code>{str(e)[:300]}</code>")
+
 
     save_threads(THREAD_FILE, threads)
 
