@@ -6,6 +6,10 @@ from __future__ import annotations
 import csv, json, os, sys, time, mimetypes, requests
 import re, hashlib
 
+def dedupe_key_for_timestamp(acc_key: str, when_utc: datetime) -> str:
+    # Clave estable: por cuenta + minuto UTC de la programación (independiente del texto/imagen)
+    return f"ts:{acc_key}:{when_utc.strftime('%Y-%m-%dT%H:%M')}"
+
 def _norm_text(t: str) -> str:
     t = (t or "").strip()
     return re.sub(r"\s+", " ", t)  # colapsa espacios y saltos de línea
@@ -262,10 +266,10 @@ def main() -> None:
             if not text:
                 continue
 
-            # DEDUPE GLOBAL por texto (por cuenta/idioma)
-            dedupe_key = dedupe_key_for(acc.lang, text)
+            # DEDUPE POR FECHA+HORA (por cuenta), independiente del texto/imagen
+            dedupe_key = dedupe_key_for_timestamp(acc.key, wutc)
             if (dedupe_key, acc.key) in posted:
-                print(f"SKIP (dedupe) {dedupe_key} ya publicado por {acc.key}")
+                print(f"SKIP (dedupe-ts) {dedupe_key} ya publicado por {acc.key}")
                 continue
 
             # Imagen (opcional)
