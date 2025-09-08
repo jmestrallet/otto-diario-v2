@@ -44,6 +44,9 @@ jobs:
           REFRESH_TOKEN_ACC1: ${{ secrets.REFRESH_TOKEN_ACC1 }}
           REFRESH_TOKEN_ACC2: ${{ secrets.REFRESH_TOKEN_ACC2 }}
           REFRESH_TOKEN_ACC3: ${{ secrets.REFRESH_TOKEN_ACC3 }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ vars.TELEGRAM_CHAT_ID }}
+          TELEGRAM_NOTIFY: ${{ vars.TELEGRAM_NOTIFY }}
 
           ACCOUNTS_JSON: ${{ vars.ACCOUNTS_JSON }}
           CSV_FILE: ${{ vars.CSV_FILE }}
