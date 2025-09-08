@@ -5,26 +5,15 @@ from __future__ import annotations
 
 import csv, json, os, sys, time, mimetypes, requests
 import re, hashlib
-
-def dedupe_key_for_timestamp(acc_key: str, when_utc: datetime) -> str:
-    # Clave estable: por cuenta + minuto UTC de la programación (independiente del texto/imagen)
-    return f"ts:{acc_key}:{when_utc.strftime('%Y-%m-%dT%H:%M')}"
-
-def _norm_text(t: str) -> str:
-    t = (t or "").strip()
-    return re.sub(r"\s+", " ", t)  # colapsa espacios y saltos de línea
-
-def dedupe_key_for(acc_lang: str, text: str) -> str:
-    # No depende de fecha/hora ni de la imagen. "mismo texto" => misma clave.
-    base = f"{acc_lang}|{_norm_text(text)}"
-    return "v2:" + hashlib.sha256(base.encode("utf-8")).hexdigest()[:16]
-    
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Tuple
 from urllib.parse import urlparse
 
+# ==========================
+# Config/API endpoints
+# ==========================
 API_BASE = "https://api.x.com"
 OAUTH_TOKEN_URL = f"{API_BASE}/2/oauth2/token"
 
@@ -40,28 +29,41 @@ ME_URL = f"{API_BASE}/2/users/me"
 
 MVD_TZ = ZoneInfo("America/Montevideo")
 
+# Archivo de hilos (persistente en repo)
+def env(name: str, default: Optional[str] = None) -> str:
+    v = os.getenv(name)
+    return default if v in (None, "") else v
+
+THREAD_FILE = env("THREAD_FILE", "threads.json")
+
+# ==========================
+# Utilidades
+# ==========================
+def _norm_text(t: str) -> str:
+    t = (t or "").strip()
+    return re.sub(r"\s+", " ", t)
+
+def dedupe_key_for_timestamp(acc_key: str, when_utc: datetime) -> str:
+    # Clave estable por cuenta + minuto UTC programado (independiente de texto/imagen)
+    return f"ts:{acc_key}:{when_utc.strftime('%Y-%m-%dT%H:%M')}"
+
 @dataclass
 class Account:
     key: str     # ACC1 / ACC2 / ACC3
     lang: str    # es / en / de
     refresh_token: str
 
-def env(name: str, default: Optional[str] = None) -> str:
-    v = os.getenv(name)
-    return default if v in (None, "") else v
-
 def load_accounts() -> list[Account]:
     mapping = json.loads(env("ACCOUNTS_JSON", '{"ACC1":"es","ACC2":"en","ACC3":"de"}'))
     accs: list[Account] = []
     for key, lang in mapping.items():
-        # Prioriza Variables sobre Secrets si ambos existen
         rt = env(f"REFRESH_TOKEN_{key}", "")
         if rt:
             accs.append(Account(key=key, lang=lang, refresh_token=rt))
     return accs
 
 def parse_csv_row(row: dict) -> dict:
-    for k in ["fecha","hora_MVD","imagen","alt_es","alt_en","alt_de","texto_es","texto_en","texto_de"]:
+    for k in ["fecha","hora_MVD","imagen","alt_es","alt_en","alt_de","texto_es","texto_en","texto_de","thread"]:
         row.setdefault(k, "")
     return row
 
@@ -76,29 +78,22 @@ def in_window(when_utc: datetime, window_min: int) -> bool:
     n = now_utc()
     return (n - timedelta(minutes=window_min)) <= when_utc <= n
 
-def unique_row_key(row: dict) -> str:
-    # Solo para compatibilidad con posted.csv antiguo (no usado para dedupe real)
-    return f"{row['fecha']}_{row['hora_MVD']}_{row['texto_es'][:20]}"
-
-def read_posted(state_file: str) -> set[tuple[str, str]]:
-    s: set[tuple[str, str]] = set()
+def read_posted(state_file: str) -> set[Tuple[str, str]]:
+    s: set[Tuple[str,str]] = set()
     if os.path.exists(state_file):
         with open(state_file, "r", encoding="utf-8", newline="") as f:
-            r = csv.DictReader(f)
-            for row in r:
-                k = row.get("dedupe_key") or row.get("key") or ""
-                s.add((k, row.get("account", "")))
+            for r in csv.DictReader(f):
+                k = r.get("dedupe_key") or r.get("key") or ""
+                s.add((k, r.get("account","")))
     return s
-
 
 def append_posted(state_file: str, dedupe_key: str, account: str, tweet_id: str, text_preview: str) -> None:
     exists = os.path.exists(state_file)
     with open(state_file, "a", encoding="utf-8", newline="") as f:
         w = csv.writer(f)
         if not exists:
-            w.writerow(["dedupe_key", "account", "posted_at_utc", "tweet_id", "text_preview"])
+            w.writerow(["dedupe_key","account","posted_at_utc","tweet_id","text_preview"])
         w.writerow([dedupe_key, account, datetime.now(timezone.utc).isoformat(), tweet_id, text_preview[:60]])
-
 
 def detect_mime(path_or_url: str, content_bytes: Optional[bytes]) -> str:
     parsed = urlparse(path_or_url)
@@ -205,9 +200,12 @@ def set_media_alt_text(access_token: str, media_id: str, alt_text: str) -> None:
         try: print(f"ALT WARN: {r.status_code} {r.json()}")
         except Exception: print(f"ALT WARN: {r.status_code} {r.text[:200]}")
 
-def post_tweet_v2(access_token: str, text: str, media_id: Optional[str]) -> dict:
+def post_tweet_v2(access_token: str, text: str, media_id: Optional[str] = None, reply_to: Optional[str] = None) -> dict:
     body: Dict = {"text": text}
-    if media_id: body["media"] = {"media_ids":[str(media_id)]}
+    if media_id:
+        body["media"] = {"media_ids":[str(media_id)]}
+    if reply_to:
+        body["reply"] = {"in_reply_to_tweet_id": str(reply_to)}
     r = requests.post(TWEETS_URL,
                       headers={"Authorization": f"Bearer {access_token}","Content-Type":"application/json"},
                       json=body, timeout=30)
@@ -215,6 +213,20 @@ def post_tweet_v2(access_token: str, text: str, media_id: Optional[str]) -> dict
     if r.status_code >= 400: raise RuntimeError(f"/2/tweets error: {j}")
     return j
 
+def load_threads(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_threads(path: str, data: dict) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+
+# ==========================
+# Main
+# ==========================
 def main() -> None:
     client_id = env("X_CLIENT_ID")
     if not client_id:
@@ -233,9 +245,10 @@ def main() -> None:
         print(f"No existe {csv_file}."); return
 
     posted = read_posted(state_file)
-
     with open(csv_file,"r",encoding="utf-8") as f:
         rows = [parse_csv_row(r) for r in csv.DictReader(f)]
+
+    threads = load_threads(THREAD_FILE)
 
     for acc in accounts:
         print(f"\n=== {acc.key} ({acc.lang}) ===")
@@ -244,7 +257,7 @@ def main() -> None:
             access_token = tok["access_token"]
             new_rt = tok.get("refresh_token","")
             if new_rt and new_rt != acc.refresh_token:
-                # guarda para que el workflow lo propague a Variables del repo
+                # guarda para que el workflow lo rote en Secrets
                 save_rotating_token(acc.key, new_rt)
             _ = get_me(access_token)
         except Exception as e:
@@ -254,43 +267,50 @@ def main() -> None:
             try:
                 wutc = when_utc_from_row(row["fecha"], row["hora_MVD"])
             except Exception as e:
-                print(f"ROW TIME ERROR: {e} -> {row}")
+                print(f"ROW TIME ERROR: {e} -> {row}"); continue
+
+            if not in_window(wutc, window_min): 
                 continue
 
-            if not in_window(wutc, window_min):
-                continue
-
-            # Texto según idioma de la cuenta
+            # Texto según idioma
             txt_key, alt_key = f"texto_{acc.lang}", f"alt_{acc.lang}"
             text = (row.get(txt_key) or "").strip()
             if not text:
                 continue
 
-            # DEDUPE POR FECHA+HORA (por cuenta), independiente del texto/imagen
+            # DEDUPE por fecha+hora (por cuenta)
             dedupe_key = dedupe_key_for_timestamp(acc.key, wutc)
             if (dedupe_key, acc.key) in posted:
                 print(f"SKIP (dedupe-ts) {dedupe_key} ya publicado por {acc.key}")
                 continue
 
-            # Imagen (opcional)
+            # Reply al hilo (si hay thread=...)
+            thread_key = (row.get("thread") or "").strip()
+            reply_to_id = threads.get(f"{acc.key}:{thread_key}") if thread_key else None
+
+            # Imagen opcional (1)
             media_id = None
             img = (row.get("imagen") or "").strip()
             if img:
                 try:
                     b, mime = get_bytes(img)
                     media_id = upload_media_v2(access_token, b, mime)
-                    set_media_alt_text(access_token, media_id, row.get(alt_key, ""))
+                    set_media_alt_text(access_token, media_id, row.get(alt_key,""))
                 except Exception as e:
                     print(f"MEDIA ERROR -> solo texto: {e}")
 
             try:
-                resp = post_tweet_v2(access_token, text, media_id)
-                tweet_id = resp.get("data", {}).get("id")
+                resp = post_tweet_v2(access_token, text, media_id, reply_to=reply_to_id)
+                tweet_id = resp.get("data",{}).get("id")
                 print(f"publicado (oauth2) {acc.key}: tweet_id={tweet_id} cuando_utc={wutc.isoformat()}")
+                if thread_key and tweet_id:
+                    threads[f"{acc.key}:{thread_key}"] = tweet_id
                 append_posted(state_file, dedupe_key, acc.key, tweet_id or "", text)
                 posted.add((dedupe_key, acc.key))
             except Exception as e:
                 print(f"TWEET ERROR {acc.key}: {e}")
+
+    save_threads(THREAD_FILE, threads)
 
 if __name__ == "__main__":
     main()
