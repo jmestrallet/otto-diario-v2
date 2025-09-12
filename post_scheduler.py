@@ -304,7 +304,7 @@ def main() -> None:
 
     csv_file = env("CSV_FILE","calendar.csv")
     state_file = env("STATE_FILE","posted.csv")
-    window_min = int(env("WINDOW_MIN","10"))
+    window_min = int(env("WINDOW_MIN","120"))
 
     accounts = load_accounts()
     print("ACCOUNTS:", [f"{a.key}:{a.lang}" for a in accounts])
