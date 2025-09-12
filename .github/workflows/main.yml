@@ -10,7 +10,7 @@ permissions:
   actions: write
 
 concurrency:
-  group: otto-diario-scheduler
+  group: otto-scheduler-${{ github.event_name }}   # schedule y manual quedan en grupos distintos
   cancel-in-progress: true
 
 jobs:
