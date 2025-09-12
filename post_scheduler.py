@@ -1,4 +1,3 @@
-# post_scheduler.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -9,7 +8,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
 from urllib.parse import urlparse
 
 # ==========================
@@ -31,7 +30,7 @@ ME_URL = f"{API_BASE}/2/users/me"
 MVD_TZ = ZoneInfo("America/Montevideo")
 
 # ==========================
-# Helpers
+# Helpers/env
 # ==========================
 def env(name: str, default: Optional[str] = None) -> str:
     v = os.getenv(name)
@@ -39,6 +38,15 @@ def env(name: str, default: Optional[str] = None) -> str:
 
 THREAD_FILE = env("THREAD_FILE", "threads.json")
 
+# Modo catch-up y orden estricto
+CATCH_UP = env("CATCH_UP", "1") == "1"              # publica atrasados
+LOOKBACK_DAYS = int(env("LOOKBACK_DAYS", "14"))     # cuánto hacia atrás mirar
+MAX_PER_RUN = int(env("MAX_PER_RUN", "3"))          # límite por cuenta y corrida
+STRICT_CHRONO = env("STRICT_CHRONO", "1") == "1"    # nunca avanzar si hay anterior pendiente
+
+# ==========================
+# Utilidades
+# ==========================
 def _norm_text(t: str) -> str:
     t = (t or "").strip()
     return re.sub(r"\s+", " ", t)
@@ -93,23 +101,19 @@ def append_posted(state_file: str, dedupe_key: str, account: str, tweet_id: str,
         w = csv.writer(f)
         if not exists:
             w.writerow(["dedupe_key","account","posted_at_utc","tweet_id","text_preview"])
-        w.writerow([dedupe_key, account, datetime.now(timezone.utc).isoformat(), tweet_id, text_preview[:60]])
+        w.writerow([dedupe_key, account, datetime.now(timezone.utc).isoformat(), tweet_id, (text_preview or "")[:60]])
 
 def detect_mime(path_or_url: str, content_bytes: Optional[bytes]) -> str:
     parsed = urlparse(path_or_url)
     ext = os.path.splitext(parsed.path)[1].lower()
-    m = {
-        ".png":"image/png",
-        ".jpg":"image/jpeg",
-        ".jpeg":"image/jpeg",
-        ".webp":"image/webp",
-        ".gif":"image/gif"
-    }.get(ext)
+    m = {".png":"image/png",".jpg":"image/jpeg",".jpeg":"image/jpeg",".webp":"image/webp",".gif":"image/gif"}.get(ext)
     if not m and content_bytes:
         m = mimetypes.guess_type("file")[0]
     return m or "application/octet-stream"
 
 def get_bytes(path_or_url: str, timeout: int = 30):
+    if not path_or_url:
+        raise FileNotFoundError("ruta de imagen vacía")
     if path_or_url.startswith(("http://","https://")):
         r = requests.get(path_or_url, timeout=timeout); r.raise_for_status()
         data = r.content
@@ -120,21 +124,16 @@ def get_bytes(path_or_url: str, timeout: int = 30):
         data = f.read()
     return data, detect_mime(path_or_url, data)
 
-# ==========================
-# X API
-# ==========================
 def refresh_access_token(client_id: str, refresh_token: str) -> dict:
     data = {"grant_type":"refresh_token","refresh_token":refresh_token,"client_id":client_id}
-    r = requests.post(OAUTH_TOKEN_URL, data=data,
-                      headers={"Content-Type":"application/x-www-form-urlencoded"}, timeout=30)
+    r = requests.post(OAUTH_TOKEN_URL, data=data, headers={"Content-Type":"application/x-www-form-urlencoded"}, timeout=30)
     try:
         j = r.json()
     except Exception:
         j = {"error": r.text[:200]}
     print(f"TOKEN STATUS: {r.status_code} expires_in={j.get('expires_in')} token_type={j.get('token_type')}")
     if "scope" in j: print(f"SCOPES: {j['scope']}")
-    if r.status_code >= 400:
-        raise RuntimeError(f"refresh_access_token failed: {j}")
+    if r.status_code >= 400: raise RuntimeError(f"refresh_access_token failed: {j}")
     return j
 
 def save_rotating_token(acc_key: str, new_rt: str):
@@ -148,15 +147,16 @@ def save_rotating_token(acc_key: str, new_rt: str):
     with open(path,"w",encoding="utf-8") as f:
         json.dump(data,f,ensure_ascii=False)
 
-def get_me(access_token: str, max_retries: int = 3, base_wait: int = 5) -> dict:
+def get_me(access_token: str, max_retries: int = 2, base_wait: int = 5) -> dict:
     """
-    Lee /2/users/me con reintentos suaves. Nunca lanza excepción (no bloquea publicaciones).
+    Lee /2/users/me. Si 429/5xx, reintenta; si falla, NO bloquea el posteo.
     """
     url = ME_URL
     for attempt in range(1, max_retries + 1):
         r = requests.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
+        ctype = r.headers.get("content-type", "")
         try:
-            j = r.json()
+            j = r.json() if ctype and ctype.startswith("application/json") else {"raw": r.text[:200]}
         except Exception:
             j = {"raw": r.text[:200]}
         if r.status_code < 400:
@@ -167,12 +167,7 @@ def get_me(access_token: str, max_retries: int = 3, base_wait: int = 5) -> dict:
                 print("ME: (sin data)")
             return u
         if r.status_code == 429 or r.status_code >= 500:
-            reset = r.headers.get("x-rate-limit-reset")
-            if reset:
-                import time as _t
-                wait = max(3, int(reset) - int(_t.time()))
-            else:
-                wait = min(60, base_wait * (2 ** (attempt - 1)))
+            wait = min(20, base_wait * attempt)
             print(f"/2/users/me {r.status_code} -> retry {attempt}/{max_retries} en {wait}s ; resp={j}")
             time.sleep(wait)
             continue
@@ -217,71 +212,41 @@ def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str) -> s
     if proc:
         state = proc.get("state")
         while state in ("pending","in_progress"):
-            time.sleep(int(proc.get("check_after_secs",1)))
-            st = requests.get(
-                MEDIA_STATUS_URL,
-                headers={"Authorization": f"Bearer {access_token}"},
-                params={"command":"STATUS","media_id":str(media_id)},
-                timeout=30
-            ).json()
+            time.sleep(min(int(proc.get("check_after_secs",1)), 5))
+            st = requests.get(MEDIA_STATUS_URL, headers={"Authorization": f"Bearer {access_token}"},
+                              params={"command":"STATUS","media_id":str(media_id)}, timeout=30).json()
             print("MEDIA STATUS", st)
             proc = st.get("data", {}).get("processing_info") or st.get("processing_info") or {}
             state = proc.get("state")
-            if state == "failed":
-                raise RuntimeError(f"MEDIA STATUS failed: {st}")
+            if state == "failed": raise RuntimeError(f"MEDIA STATUS failed: {st}")
     return str(media_id)
 
 def set_media_alt_text(access_token: str, media_id: str, alt_text: str) -> None:
     if not alt_text: return
     payload = {"id": media_id, "metadata": {"alt_text": {"text": alt_text[:1000]}}}
-    r = requests.post(
-        MEDIA_METADATA_URL,
-        headers={"Authorization": f"Bearer {access_token}","Content-Type":"application/json"},
-        json=payload, timeout=30
-    )
+    r = requests.post(MEDIA_METADATA_URL,
+                      headers={"Authorization": f"Bearer {access_token}","Content-Type":"application/json"},
+                      json=payload, timeout=30)
     if r.status_code >= 400:
         try: print(f"ALT WARN: {r.status_code} {r.json()}")
         except Exception: print(f"ALT WARN: {r.status_code} {r.text[:200]}")
 
-def post_tweet_v2(access_token: str, text: str, media_id: Optional[str] = None,
-                  reply_to: Optional[str] = None, max_retries: int = 3) -> dict:
+def post_tweet_v2(access_token: str, text: str, media_id: Optional[str] = None, reply_to: Optional[str] = None) -> dict:
     body: Dict = {"text": text}
     if media_id:
         body["media"] = {"media_ids":[str(media_id)]}
     if reply_to:
         body["reply"] = {"in_reply_to_tweet_id": str(reply_to)}
-
-    last = None
-    for attempt in range(1, max_retries + 1):
-        r = requests.post(
-            TWEETS_URL,
-            headers={"Authorization": f"Bearer {access_token}","Content-Type":"application/json"},
-            json=body, timeout=30
-        )
-        try:
-            j = r.json()
-        except Exception:
-            j = {"raw": r.text[:200]}
-
-        # 429/5xx → backoff y reintento
-        if r.status_code == 429 or r.status_code >= 500:
-            reset = r.headers.get("x-rate-limit-reset")
-            if reset:
-                import time as _t
-                wait = max(5, int(reset) - int(_t.time()))
-            else:
-                wait = min(60, 5 * (2 ** (attempt - 1)))
-            print(f"/2/tweets {r.status_code} -> retry {attempt}/{max_retries} en {wait}s ; resp={j}")
-            time.sleep(wait)
-            last = j
-            continue
-
-        if r.status_code >= 400:
-            raise RuntimeError(f"/2/tweets error: {j}")
-
-        return j
-
-    raise RuntimeError(f"/2/tweets retry exhausted: {last}")
+    r = requests.post(TWEETS_URL,
+                      headers={"Authorization": f"Bearer {access_token}","Content-Type":"application/json"},
+                      json=body, timeout=30)
+    ctype = r.headers.get("content-type","")
+    try:
+        j = r.json() if ctype and ctype.startswith("application/json") else {"raw": r.text[:200]}
+    except Exception:
+        j = {"raw": r.text[:200]}
+    if r.status_code >= 400: raise RuntimeError(f"/2/tweets error: {j}")
+    return j
 
 def load_threads(path: str) -> dict:
     try:
@@ -295,6 +260,65 @@ def save_threads(path: str, data: dict) -> None:
         json.dump(data, f, ensure_ascii=False)
 
 # ==========================
+# Selección de filas por cuenta (catch-up/ventana)
+# ==========================
+@dataclass
+class RowItem:
+    row: dict
+    wutc: datetime
+    text: str
+    alt: str
+
+def build_items_for_account(rows: List[dict], acc: Account) -> List[RowItem]:
+    items: List[RowItem] = []
+    txt_key, alt_key = f"texto_{acc.lang}", f"alt_{acc.lang}"
+    for r in rows:
+        text = (r.get(txt_key) or "").strip()
+        if not text:
+            continue
+        try:
+            w = when_utc_from_row(r["fecha"], r["hora_MVD"])
+        except Exception:
+            continue
+        items.append(RowItem(row=r, wutc=w, text=text, alt=(r.get(alt_key) or "").strip()))
+    return items
+
+def choose_candidates(acc: Account, items: List[RowItem], posted: set[Tuple[str,str]], window_min: int) -> List[RowItem]:
+    """ Devuelve la lista a publicar para esta corrida y cuenta. """
+    now = now_utc()
+    # No publicados
+    unposted = [it for it in items if (dedupe_key_for_timestamp(acc.key, it.wutc), acc.key) not in posted and it.wutc <= now]
+
+    if not unposted:
+        return []
+
+    # Orden cronológico
+    unposted.sort(key=lambda x: x.wutc)
+
+    # Si hay backlog (al menos uno anterior a ahora):
+    if CATCH_UP:
+        floor_dt = now - timedelta(days=LOOKBACK_DAYS)
+        backlog = [it for it in unposted if it.wutc >= floor_dt]
+        # Publicar los más antiguos primero, hasta MAX_PER_RUN
+        return backlog[:MAX_PER_RUN]
+
+    # Sin catch-up: mantener ventana, pero no avanzar si hay más antiguos sin publicar
+    earliest = unposted[0].wutc
+    windowed = [it for it in unposted if in_window(it.wutc, window_min)]
+    # Si hay ventana vacía pero existen más antiguos -> no publico nada (espera)
+    if not windowed and STRICT_CHRONO:
+        print(f"BACKLOG DETECTADO {acc.key}: hay pendiente anterior a la ventana ({earliest.isoformat()}). Activa CATCH_UP=1 para recuperarlos.")
+        return []
+    # Si hay ventana con items pero STRICT_CHRONO impide saltar:
+    if STRICT_CHRONO and windowed:
+        # Sólo permito los que coincidan con el más antiguo
+        oldest_in_window = min(it.wutc for it in windowed)
+        if earliest < oldest_in_window:
+            print(f"BLOQUEADO {acc.key}: existen más antiguos ({earliest.isoformat()}) fuera de ventana. Activa CATCH_UP=1.")
+            return []
+    return windowed
+
+# ==========================
 # Main
 # ==========================
 def main() -> None:
@@ -304,7 +328,7 @@ def main() -> None:
 
     csv_file = env("CSV_FILE","calendar.csv")
     state_file = env("STATE_FILE","posted.csv")
-    window_min = int(env("WINDOW_MIN","120"))
+    window_min = int(env("WINDOW_MIN","10"))
 
     accounts = load_accounts()
     print("ACCOUNTS:", [f"{a.key}:{a.lang}" for a in accounts])
@@ -320,74 +344,55 @@ def main() -> None:
 
     threads = load_threads(THREAD_FILE)
 
-    for idx, acc in enumerate(accounts):
-        if idx:
-            time.sleep(3)  # pequeña pausa entre cuentas (2–5s ayuda con 429)
-
+    for acc in accounts:
         print(f"\n=== {acc.key} ({acc.lang}) ===")
-
-        # 1) SOLO el refresh dentro del try/except (si falla, sí se salta la cuenta)
+        # Token + verificación no bloqueante
         try:
             tok = refresh_access_token(client_id, acc.refresh_token)
             access_token = tok["access_token"]
             new_rt = tok.get("refresh_token","")
             if new_rt and new_rt != acc.refresh_token:
                 save_rotating_token(acc.key, new_rt)
+            _ = get_me(access_token)  # tolerante
         except Exception as e:
             print(f"AUTH ERROR {acc.key}: {e}")
             continue
 
-        # 2) Verificación suave de cuenta (jamás corta publicación)
-        _ = get_me(access_token)
+        # Construir items y elegir candidatos
+        items = build_items_for_account(rows, acc)
+        candidates = choose_candidates(acc, items, posted, window_min)
+        if not candidates:
+            continue
 
-        # 3) Recorre filas y publica lo que cae en ventana
-        for row in rows:
-            try:
-                wutc = when_utc_from_row(row["fecha"], row["hora_MVD"])
-            except Exception as e:
-                print(f"ROW TIME ERROR: {e} -> {row}")
-                continue
-
-            if not in_window(wutc, window_min):
-                continue
-
-            # Texto según idioma
-            txt_key, alt_key = f"texto_{acc.lang}", f"alt_{acc.lang}"
-            text = (row.get(txt_key) or "").strip()
-            if not text:
-                continue
-
+        for it in candidates:
             # DEDUPE por fecha+hora (por cuenta)
-            dedupe_key = dedupe_key_for_timestamp(acc.key, wutc)
+            dedupe_key = dedupe_key_for_timestamp(acc.key, it.wutc)
             if (dedupe_key, acc.key) in posted:
                 print(f"SKIP (dedupe-ts) {dedupe_key} ya publicado por {acc.key}")
                 continue
 
             # Reply al hilo (si hay thread=...)
-            thread_key = (row.get("thread") or "").strip()
+            thread_key = (it.row.get("thread") or "").strip()
             reply_to_id = threads.get(f"{acc.key}:{thread_key}") if thread_key else None
 
             # Imagen opcional (1)
             media_id = None
-            img = (row.get("imagen") or "").strip()
+            img = (it.row.get("imagen") or "").strip()
             if img:
                 try:
                     b, mime = get_bytes(img)
                     media_id = upload_media_v2(access_token, b, mime)
-                    set_media_alt_text(access_token, media_id, row.get(alt_key,""))
+                    set_media_alt_text(access_token, media_id, it.alt)
                 except Exception as e:
                     print(f"MEDIA ERROR -> solo texto: {e}")
 
-            # Post (con reintentos en /2/tweets)
             try:
-                resp = post_tweet_v2(access_token, text, media_id, reply_to=reply_to_id, max_retries=3)
+                resp = post_tweet_v2(access_token, it.text, media_id, reply_to=reply_to_id)
                 tweet_id = resp.get("data",{}).get("id")
-                print(f"publicado (oauth2) {acc.key}: tweet_id={tweet_id} cuando_utc={wutc.isoformat()}")
-
+                print(f"publicado (oauth2) {acc.key}: tweet_id={tweet_id} cuando_utc={it.wutc.isoformat()}")
                 if thread_key and tweet_id:
                     threads[f"{acc.key}:{thread_key}"] = tweet_id
-
-                append_posted(state_file, dedupe_key, acc.key, tweet_id or "", text)
+                append_posted(state_file, dedupe_key, acc.key, tweet_id or "", it.text)
                 posted.add((dedupe_key, acc.key))
             except Exception as e:
                 print(f"TWEET ERROR {acc.key}: {e}")
