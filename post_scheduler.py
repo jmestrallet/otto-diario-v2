@@ -1,10 +1,11 @@
+# post_scheduler.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
 
 import csv, json, os, sys, time, mimetypes, requests
-import re, hashlib
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -29,16 +30,15 @@ ME_URL = f"{API_BASE}/2/users/me"
 
 MVD_TZ = ZoneInfo("America/Montevideo")
 
-# Archivo de hilos (persistente en repo)
+# ==========================
+# Helpers
+# ==========================
 def env(name: str, default: Optional[str] = None) -> str:
     v = os.getenv(name)
     return default if v in (None, "") else v
 
 THREAD_FILE = env("THREAD_FILE", "threads.json")
 
-# ==========================
-# Utilidades
-# ==========================
 def _norm_text(t: str) -> str:
     t = (t or "").strip()
     return re.sub(r"\s+", " ", t)
@@ -98,7 +98,13 @@ def append_posted(state_file: str, dedupe_key: str, account: str, tweet_id: str,
 def detect_mime(path_or_url: str, content_bytes: Optional[bytes]) -> str:
     parsed = urlparse(path_or_url)
     ext = os.path.splitext(parsed.path)[1].lower()
-    m = {".png":"image/png",".jpg":"image/jpeg",".jpeg":"image/jpeg",".webp":"image/webp",".gif":"image/gif"}.get(ext)
+    m = {
+        ".png":"image/png",
+        ".jpg":"image/jpeg",
+        ".jpeg":"image/jpeg",
+        ".webp":"image/webp",
+        ".gif":"image/gif"
+    }.get(ext)
     if not m and content_bytes:
         m = mimetypes.guess_type("file")[0]
     return m or "application/octet-stream"
@@ -114,16 +120,21 @@ def get_bytes(path_or_url: str, timeout: int = 30):
         data = f.read()
     return data, detect_mime(path_or_url, data)
 
+# ==========================
+# X API
+# ==========================
 def refresh_access_token(client_id: str, refresh_token: str) -> dict:
     data = {"grant_type":"refresh_token","refresh_token":refresh_token,"client_id":client_id}
-    r = requests.post(OAUTH_TOKEN_URL, data=data, headers={"Content-Type":"application/x-www-form-urlencoded"}, timeout=30)
+    r = requests.post(OAUTH_TOKEN_URL, data=data,
+                      headers={"Content-Type":"application/x-www-form-urlencoded"}, timeout=30)
     try:
         j = r.json()
     except Exception:
         j = {"error": r.text[:200]}
     print(f"TOKEN STATUS: {r.status_code} expires_in={j.get('expires_in')} token_type={j.get('token_type')}")
     if "scope" in j: print(f"SCOPES: {j['scope']}")
-    if r.status_code >= 400: raise RuntimeError(f"refresh_access_token failed: {j}")
+    if r.status_code >= 400:
+        raise RuntimeError(f"refresh_access_token failed: {j}")
     return j
 
 def save_rotating_token(acc_key: str, new_rt: str):
@@ -137,13 +148,38 @@ def save_rotating_token(acc_key: str, new_rt: str):
     with open(path,"w",encoding="utf-8") as f:
         json.dump(data,f,ensure_ascii=False)
 
-def get_me(access_token: str) -> dict:
-    r = requests.get(ME_URL, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
-    j = r.json()
-    if r.status_code >= 400: raise RuntimeError(f"/2/users/me failed: {j}")
-    u = j.get("data",{})
-    print(f"ME: id={u.get('id')} username=@{u.get('username')}")
-    return u
+def get_me(access_token: str, max_retries: int = 3, base_wait: int = 5) -> dict:
+    """
+    Lee /2/users/me con reintentos suaves. Nunca lanza excepción (no bloquea publicaciones).
+    """
+    url = ME_URL
+    for attempt in range(1, max_retries + 1):
+        r = requests.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
+        try:
+            j = r.json()
+        except Exception:
+            j = {"raw": r.text[:200]}
+        if r.status_code < 400:
+            u = j.get("data", {}) or {}
+            if u:
+                print(f"ME: id={u.get('id')} username=@{u.get('username')}")
+            else:
+                print("ME: (sin data)")
+            return u
+        if r.status_code == 429 or r.status_code >= 500:
+            reset = r.headers.get("x-rate-limit-reset")
+            if reset:
+                import time as _t
+                wait = max(3, int(reset) - int(_t.time()))
+            else:
+                wait = min(60, base_wait * (2 ** (attempt - 1)))
+            print(f"/2/users/me {r.status_code} -> retry {attempt}/{max_retries} en {wait}s ; resp={j}")
+            time.sleep(wait)
+            continue
+        print(f"ME WARN: {r.status_code} {j}")
+        return {}
+    print("ME WARN: reintentos agotados, continuo sin verificación de cuenta")
+    return {}
 
 def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str) -> str:
     # INIT
@@ -182,36 +218,70 @@ def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str) -> s
         state = proc.get("state")
         while state in ("pending","in_progress"):
             time.sleep(int(proc.get("check_after_secs",1)))
-            st = requests.get(MEDIA_STATUS_URL, headers={"Authorization": f"Bearer {access_token}"},
-                              params={"command":"STATUS","media_id":str(media_id)}, timeout=30).json()
+            st = requests.get(
+                MEDIA_STATUS_URL,
+                headers={"Authorization": f"Bearer {access_token}"},
+                params={"command":"STATUS","media_id":str(media_id)},
+                timeout=30
+            ).json()
             print("MEDIA STATUS", st)
             proc = st.get("data", {}).get("processing_info") or st.get("processing_info") or {}
             state = proc.get("state")
-            if state == "failed": raise RuntimeError(f"MEDIA STATUS failed: {st}")
+            if state == "failed":
+                raise RuntimeError(f"MEDIA STATUS failed: {st}")
     return str(media_id)
 
 def set_media_alt_text(access_token: str, media_id: str, alt_text: str) -> None:
     if not alt_text: return
     payload = {"id": media_id, "metadata": {"alt_text": {"text": alt_text[:1000]}}}
-    r = requests.post(MEDIA_METADATA_URL,
-                      headers={"Authorization": f"Bearer {access_token}","Content-Type":"application/json"},
-                      json=payload, timeout=30)
+    r = requests.post(
+        MEDIA_METADATA_URL,
+        headers={"Authorization": f"Bearer {access_token}","Content-Type":"application/json"},
+        json=payload, timeout=30
+    )
     if r.status_code >= 400:
         try: print(f"ALT WARN: {r.status_code} {r.json()}")
         except Exception: print(f"ALT WARN: {r.status_code} {r.text[:200]}")
 
-def post_tweet_v2(access_token: str, text: str, media_id: Optional[str] = None, reply_to: Optional[str] = None) -> dict:
+def post_tweet_v2(access_token: str, text: str, media_id: Optional[str] = None,
+                  reply_to: Optional[str] = None, max_retries: int = 3) -> dict:
     body: Dict = {"text": text}
     if media_id:
         body["media"] = {"media_ids":[str(media_id)]}
     if reply_to:
         body["reply"] = {"in_reply_to_tweet_id": str(reply_to)}
-    r = requests.post(TWEETS_URL,
-                      headers={"Authorization": f"Bearer {access_token}","Content-Type":"application/json"},
-                      json=body, timeout=30)
-    j = r.json()
-    if r.status_code >= 400: raise RuntimeError(f"/2/tweets error: {j}")
-    return j
+
+    last = None
+    for attempt in range(1, max_retries + 1):
+        r = requests.post(
+            TWEETS_URL,
+            headers={"Authorization": f"Bearer {access_token}","Content-Type":"application/json"},
+            json=body, timeout=30
+        )
+        try:
+            j = r.json()
+        except Exception:
+            j = {"raw": r.text[:200]}
+
+        # 429/5xx → backoff y reintento
+        if r.status_code == 429 or r.status_code >= 500:
+            reset = r.headers.get("x-rate-limit-reset")
+            if reset:
+                import time as _t
+                wait = max(5, int(reset) - int(_t.time()))
+            else:
+                wait = min(60, 5 * (2 ** (attempt - 1)))
+            print(f"/2/tweets {r.status_code} -> retry {attempt}/{max_retries} en {wait}s ; resp={j}")
+            time.sleep(wait)
+            last = j
+            continue
+
+        if r.status_code >= 400:
+            raise RuntimeError(f"/2/tweets error: {j}")
+
+        return j
+
+    raise RuntimeError(f"/2/tweets retry exhausted: {last}")
 
 def load_threads(path: str) -> dict:
     try:
@@ -250,26 +320,35 @@ def main() -> None:
 
     threads = load_threads(THREAD_FILE)
 
-    for acc in accounts:
+    for idx, acc in enumerate(accounts):
+        if idx:
+            time.sleep(3)  # pequeña pausa entre cuentas (2–5s ayuda con 429)
+
         print(f"\n=== {acc.key} ({acc.lang}) ===")
+
+        # 1) SOLO el refresh dentro del try/except (si falla, sí se salta la cuenta)
         try:
             tok = refresh_access_token(client_id, acc.refresh_token)
             access_token = tok["access_token"]
             new_rt = tok.get("refresh_token","")
             if new_rt and new_rt != acc.refresh_token:
-                # guarda para que el workflow lo rote en Secrets
                 save_rotating_token(acc.key, new_rt)
-            _ = get_me(access_token)
         except Exception as e:
-            print(f"AUTH ERROR {acc.key}: {e}"); continue
+            print(f"AUTH ERROR {acc.key}: {e}")
+            continue
 
+        # 2) Verificación suave de cuenta (jamás corta publicación)
+        _ = get_me(access_token)
+
+        # 3) Recorre filas y publica lo que cae en ventana
         for row in rows:
             try:
                 wutc = when_utc_from_row(row["fecha"], row["hora_MVD"])
             except Exception as e:
-                print(f"ROW TIME ERROR: {e} -> {row}"); continue
+                print(f"ROW TIME ERROR: {e} -> {row}")
+                continue
 
-            if not in_window(wutc, window_min): 
+            if not in_window(wutc, window_min):
                 continue
 
             # Texto según idioma
@@ -299,12 +378,15 @@ def main() -> None:
                 except Exception as e:
                     print(f"MEDIA ERROR -> solo texto: {e}")
 
+            # Post (con reintentos en /2/tweets)
             try:
-                resp = post_tweet_v2(access_token, text, media_id, reply_to=reply_to_id)
+                resp = post_tweet_v2(access_token, text, media_id, reply_to=reply_to_id, max_retries=3)
                 tweet_id = resp.get("data",{}).get("id")
                 print(f"publicado (oauth2) {acc.key}: tweet_id={tweet_id} cuando_utc={wutc.isoformat()}")
+
                 if thread_key and tweet_id:
                     threads[f"{acc.key}:{thread_key}"] = tweet_id
+
                 append_posted(state_file, dedupe_key, acc.key, tweet_id or "", text)
                 posted.add((dedupe_key, acc.key))
             except Exception as e:
