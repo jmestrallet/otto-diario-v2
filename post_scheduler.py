@@ -1,4 +1,3 @@
-# post_scheduler.py
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -30,25 +29,20 @@ ME_URL = f"{API_BASE}/2/users/me"
 
 MVD_TZ = ZoneInfo("America/Montevideo")
 
-# ==========================
-# Helpers ENV
-# ==========================
+# --------------------------
+# Env helpers
+# --------------------------
 def env(name: str, default: Optional[str] = None) -> str:
     v = os.getenv(name)
     return default if v in (None, "") else v
 
-# ARCHIVOS DE ESTADO
-THREAD_FILE = env("THREAD_FILE", "threads.json")
-
-# Modo de operación
-CATCH_UP = int(env("CATCH_UP", "1"))               # 1 = publicar atrasados (hasta MAX_PER_RUN), 0 = sólo ventana WINDOW_MIN
-LOOKBACK_DAYS = int(env("LOOKBACK_DAYS", "14"))    # cuánto hacia atrás mirar en catch-up
-MAX_PER_RUN = int(env("MAX_PER_RUN", "1"))         # máximo de publicaciones por cuenta en una corrida
-STRICT_CHRONO = int(env("STRICT_CHRONO", "1"))     # 1 = nunca publicar uno más nuevo si hay uno más viejo pendiente
-MIN_GAP_MIN = int(env("MIN_GAP_MIN", "0"))         # 0 = sin throttle; si >0 exige ese mínimo entre posts por cuenta
-
-PAUSE_BETWEEN_ACCOUNTS_SEC = int(env("PAUSE_BETWEEN_ACCOUNTS_SEC", "3"))
-PAUSE_BETWEEN_POSTS_SEC = int(env("PAUSE_BETWEEN_POSTS_SEC", "2"))
+# Catch-up / límites (por Variables o Secrets → Variables)
+CATCH_UP       = int(env("CATCH_UP", "0"))         # 1 = habilitar atrapar atrasados
+LOOKBACK_DAYS  = int(env("LOOKBACK_DAYS", "7"))    # cuántos días hacia atrás mira
+STRICT_CHRONO  = int(env("STRICT_CHRONO", "1"))    # 1 = del más viejo al más nuevo
+MAX_PER_RUN    = int(env("MAX_PER_RUN", "1"))      # máximo por cuenta en un run
+MIN_GAP_MIN    = int(env("MIN_GAP_MIN", "60"))     # separación mínima entre tweets de una cuenta
+THREAD_FILE    = env("THREAD_FILE", "threads.json")
 
 # ==========================
 # Utilidades
@@ -67,9 +61,9 @@ class Account:
     lang: str    # es / en / de
     refresh_token: str
 
-def load_accounts() -> list[Account]:
+def load_accounts() -> List[Account]:
     mapping = json.loads(env("ACCOUNTS_JSON", '{"ACC1":"es","ACC2":"en","ACC3":"de"}'))
-    accs: list[Account] = []
+    accs: List[Account] = []
     for key, lang in mapping.items():
         rt = env(f"REFRESH_TOKEN_{key}", "")
         if rt:
@@ -92,14 +86,37 @@ def in_window(when_utc: datetime, window_min: int) -> bool:
     n = now_utc()
     return (n - timedelta(minutes=window_min)) <= when_utc <= n
 
-def read_posted(state_file: str) -> set[Tuple[str, str]]:
-    s: set[Tuple[str,str]] = set()
+def read_posted_rows(state_file: str) -> List[dict]:
+    rows: List[dict] = []
     if os.path.exists(state_file):
         with open(state_file, "r", encoding="utf-8", newline="") as f:
             for r in csv.DictReader(f):
-                k = r.get("dedupe_key") or r.get("key") or ""
-                s.add((k, r.get("account","")))
+                rows.append(r)
+    return rows
+
+def posted_set_from_rows(rows: List[dict]) -> set[Tuple[str, str]]:
+    s: set[Tuple[str,str]] = set()
+    for r in rows:
+        k = r.get("dedupe_key") or r.get("key") or ""
+        s.add((k, r.get("account","")))
     return s
+
+def last_post_time_by_account(rows: List[dict]) -> Dict[str, datetime]:
+    last: Dict[str, datetime] = {}
+    for r in rows:
+        acc = r.get("account","")
+        ts = r.get("posted_at_utc","")
+        if not acc or not ts:
+            continue
+        try:
+            dt = datetime.fromisoformat(ts)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            continue
+        if acc not in last or dt > last[acc]:
+            last[acc] = dt
+    return last
 
 def append_posted(state_file: str, dedupe_key: str, account: str, tweet_id: str, text_preview: str) -> None:
     exists = os.path.exists(state_file)
@@ -107,7 +124,7 @@ def append_posted(state_file: str, dedupe_key: str, account: str, tweet_id: str,
         w = csv.writer(f)
         if not exists:
             w.writerow(["dedupe_key","account","posted_at_utc","tweet_id","text_preview"])
-        w.writerow([dedupe_key, account, datetime.now(timezone.utc).isoformat(), tweet_id, (text_preview or "")[:140]])
+        w.writerow([dedupe_key, account, datetime.now(timezone.utc).isoformat(), tweet_id, text_preview[:60]])
 
 def detect_mime(path_or_url: str, content_bytes: Optional[bytes]) -> str:
     parsed = urlparse(path_or_url)
@@ -152,18 +169,13 @@ def save_rotating_token(acc_key: str, new_rt: str):
         json.dump(data,f,ensure_ascii=False)
 
 def get_me(access_token: str, max_retries: int = 3, base_wait: int = 5) -> dict:
-    """
-    Lee /2/users/me con reintentos breves ante 429/5xx. Si falla, devuelve {} sin bloquear.
-    """
     url = ME_URL
     for attempt in range(1, max_retries + 1):
         r = requests.get(url, headers={"Authorization": f"Bearer {access_token}"}, timeout=30)
-        ctype = r.headers.get("content-type", "")
         try:
-            j = r.json() if ctype and ctype.startswith("application/json") else {"raw": r.text[:200]}
+            j = r.json()
         except Exception:
             j = {"raw": r.text[:200]}
-
         if r.status_code < 400:
             u = j.get("data", {}) or {}
             if u:
@@ -171,7 +183,6 @@ def get_me(access_token: str, max_retries: int = 3, base_wait: int = 5) -> dict:
             else:
                 print("ME: (sin data)")
             return u
-
         if r.status_code == 429 or r.status_code >= 500:
             reset = r.headers.get("x-rate-limit-reset")
             if reset:
@@ -180,9 +191,7 @@ def get_me(access_token: str, max_retries: int = 3, base_wait: int = 5) -> dict:
             else:
                 wait = min(60, base_wait * (2 ** (attempt - 1)))
             print(f"/2/users/me {r.status_code} -> retry {attempt}/{max_retries} en {wait}s ; resp={j}")
-            time.sleep(wait)
-            continue
-
+            time.sleep(wait); continue
         print(f"ME WARN: {r.status_code} {j}")
         return {}
     print("ME WARN: reintentos agotados, continuo sin verificación de cuenta")
@@ -235,7 +244,7 @@ def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str) -> s
 
 def set_media_alt_text(access_token: str, media_id: str, alt_text: str) -> None:
     if not alt_text: return
-    payload = {"id": media_id, "metadata": {"alt_text": {"text": (alt_text or "")[:1000]}}}
+    payload = {"id": media_id, "metadata": {"alt_text": {"text": alt_text[:1000]}}}
     r = requests.post(MEDIA_METADATA_URL,
                       headers={"Authorization": f"Bearer {access_token}","Content-Type":"application/json"},
                       json=payload, timeout=30)
@@ -247,20 +256,17 @@ def post_tweet_v2(access_token: str, text: str, media_id: Optional[str] = None,
                   reply_to: Optional[str] = None, max_retries: int = 3) -> dict:
     body: Dict = {"text": text}
     if media_id:
-        body["media"] = {"media_ids": [str(media_id)]}
+        body["media"] = {"media_ids":[str(media_id)]}
     if reply_to:
         body["reply"] = {"in_reply_to_tweet_id": str(reply_to)}
 
     last = None
     for attempt in range(1, max_retries + 1):
-        r = requests.post(
-            TWEETS_URL,
-            headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-            json=body, timeout=30
-        )
-        ctype = r.headers.get("content-type", "")
+        r = requests.post(TWEETS_URL,
+                          headers={"Authorization": f"Bearer {access_token}","Content-Type":"application/json"},
+                          json=body, timeout=30)
         try:
-            j = r.json() if ctype and ctype.startswith("application/json") else {"raw": r.text[:200]}
+            j = r.json()
         except Exception:
             j = {"raw": r.text[:200]}
 
@@ -272,9 +278,7 @@ def post_tweet_v2(access_token: str, text: str, media_id: Optional[str] = None,
             else:
                 wait = min(60, 5 * (2 ** (attempt - 1)))
             print(f"/2/tweets {r.status_code} -> retry {attempt}/{max_retries} en {wait}s ; resp={j}")
-            time.sleep(wait)
-            last = j
-            continue
+            time.sleep(wait); last = j; continue
 
         if r.status_code >= 400:
             raise RuntimeError(f"/2/tweets error: {j}")
@@ -294,71 +298,58 @@ def save_threads(path: str, data: dict) -> None:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
 
-def load_last_post_times(state_file: str) -> dict[str, datetime]:
-    d: dict[str, datetime] = {}
-    if os.path.exists(state_file):
-        with open(state_file, "r", encoding="utf-8", newline="") as f:
-            for r in csv.DictReader(f):
-                acc = r.get("account","")
-                ts = r.get("posted_at_utc","")
-                try:
-                    t = datetime.fromisoformat(ts)
-                except Exception:
-                    continue
-                if acc and (acc not in d or t > d[acc]):
-                    d[acc] = t
-    return d
-
-# ==========================
+# --------------------------
 # Selección de candidatos
-# ==========================
-def select_candidates_for_account(
-    acc: Account,
-    rows: List[dict],
-    posted: set[Tuple[str,str]],
-    window_min: int
-) -> List[Tuple[datetime, dict, str]]:
+# --------------------------
+def select_candidates_for_account(acc: Account,
+                                  csv_rows: List[dict],
+                                  posted_set: set[Tuple[str,str]],
+                                  window_min: int,
+                                  now: datetime) -> List[Tuple[dict, datetime]]:
     """
-    Devuelve lista de tuples (when_utc, row, dedupe_key) ordenados por fecha ascendente,
-    según modo CATCH_UP/WINDOW_MIN y filtros de lookback.
+    Devuelve lista de (row, when_utc) a publicar para esta cuenta, ya filtrados:
+    - con texto para su idioma
+    - no duplicados (posted.csv)
+    - dentro de ventana si CATCH_UP=0
+    - si CATCH_UP=1: vencidos (when_utc <= now) dentro de LOOKBACK_DAYS
     """
-    now = now_utc()
-    out: List[Tuple[datetime, dict, str]] = []
+    out: List[Tuple[dict, datetime]] = []
+    lookback_dt = now - timedelta(days=LOOKBACK_DAYS)
 
-    for row in rows:
-        text = (row.get(f"texto_{acc.lang}") or "").strip()
-        if not text:
-            continue
+    for row in csv_rows:
         try:
             wutc = when_utc_from_row(row["fecha"], row["hora_MVD"])
-        except Exception:
+        except Exception as e:
+            print(f"ROW TIME ERROR: {e} -> {row}"); continue
+
+        txt_key = f"texto_{acc.lang}"
+        text = (row.get(txt_key) or "").strip()
+        if not text:
+            # sin texto para el idioma
             continue
 
-        # Sólo posts vencidos (pasados o iguales a ahora)
-        if wutc > now:
+        # dedupe por (cuenta + minuto programado)
+        dkey = dedupe_key_for_timestamp(acc.key, wutc)
+        if (dkey, acc.key) in posted_set:
+            # ya publicado alguna vez (no repetir)
             continue
 
-        # Modo ventana (sólo si CATCH_UP=0)
-        if not CATCH_UP:
-            if not in_window(wutc, window_min):
+        if CATCH_UP:
+            # sólo vencidos y dentro del lookback
+            if wutc > now:  # futuro
                 continue
+            if wutc < lookback_dt:
+                continue
+            out.append((row, wutc))
         else:
-            # Catch-up: respetar lookback
-            if wutc < now - timedelta(days=LOOKBACK_DAYS):
-                continue
+            # modo ventana clásica
+            if in_window(wutc, window_min):
+                out.append((row, wutc))
 
-        dedupe_key = dedupe_key_for_timestamp(acc.key, wutc)
-        if (dedupe_key, acc.key) in posted:
-            continue
-
-        out.append((wutc, row, dedupe_key))
-
-    # Orden cronológico ascendente
-    out.sort(key=lambda t: t[0])
-
-    # STRICT_CHRONO implica siempre tomar desde el más viejo
-    if MAX_PER_RUN > 0:
-        out = out[:MAX_PER_RUN]
+    if STRICT_CHRONO:
+        out.sort(key=lambda x: x[1])  # más viejo primero
+    else:
+        out.sort(key=lambda x: x[1], reverse=False)
 
     return out
 
@@ -372,7 +363,7 @@ def main() -> None:
 
     csv_file = env("CSV_FILE","calendar.csv")
     state_file = env("STATE_FILE","posted.csv")
-    window_min = int(env("WINDOW_MIN","10"))
+    window_min = int(env("WINDOW_MIN","15"))
 
     accounts = load_accounts()
     print("ACCOUNTS:", [f"{a.key}:{a.lang}" for a in accounts])
@@ -382,63 +373,79 @@ def main() -> None:
     if not os.path.exists(csv_file):
         print(f"No existe {csv_file}."); return
 
-    posted = read_posted(state_file)
+    # Cargar CSV y estado
     with open(csv_file,"r",encoding="utf-8") as f:
         rows = [parse_csv_row(r) for r in csv.DictReader(f)]
 
+    posted_rows = read_posted_rows(state_file)
+    posted_set  = posted_set_from_rows(posted_rows)
+    last_by_acc = last_post_time_by_account(posted_rows)
+
     threads = load_threads(THREAD_FILE)
-    last_times = load_last_post_times(state_file)
+    now = now_utc()
 
     for idx, acc in enumerate(accounts):
         if idx:
-            time.sleep(PAUSE_BETWEEN_ACCOUNTS_SEC)
+            time.sleep(2)  # breve pausa entre cuentas
 
         print(f"\n=== {acc.key} ({acc.lang}) ===")
-        # Throttle por cuenta (en minutos)
-        if MIN_GAP_MIN > 0:
-            lt = last_times.get(acc.key)
-            if lt:
-                delta = now_utc() - lt
-                if delta < timedelta(minutes=MIN_GAP_MIN):
-                    mins = int(delta.total_seconds() // 60)
-                    left = int((timedelta(minutes=MIN_GAP_MIN) - delta).total_seconds() // 60)
-                    print(f"THROTTLE {acc.key}: último hace {mins}min; faltan ~{left}min."); 
-                    continue
-
-        # Token + verificación ligera (no bloqueante)
+        # Auth
         try:
             tok = refresh_access_token(client_id, acc.refresh_token)
             access_token = tok["access_token"]
             new_rt = tok.get("refresh_token","")
             if new_rt and new_rt != acc.refresh_token:
                 save_rotating_token(acc.key, new_rt)
-            _ = get_me(access_token)  # no bloquea si 429
+            _ = get_me(access_token)
         except Exception as e:
-            print(f"AUTH ERROR {acc.key}: {e}"); 
-            continue
+            print(f"AUTH ERROR {acc.key}: {e}"); continue
 
-        # Elegir candidatos
-        candidates = select_candidates_for_account(acc, rows, posted, window_min)
+        # Throttle por separación mínima
+        last_post_dt = last_by_acc.get(acc.key)
+        if last_post_dt:
+            mins = (now - last_post_dt).total_seconds()/60.0
+            if mins < MIN_GAP_MIN:
+                faltan = int(MIN_GAP_MIN - mins)
+                print(f"THROTTLE {acc.key}: último hace {mins:.1f} min; faltan ~{faltan} min para MIN_GAP_MIN={MIN_GAP_MIN}")
+                continue
+
+        # Selección de candidatos
+        candidates = select_candidates_for_account(acc, rows, posted_set, window_min, now)
+        print(f"CANDIDATOS {acc.key}: {len(candidates)} (catch_up={CATCH_UP}, lookback_days={LOOKBACK_DAYS}, window_min={window_min})")
+
         if not candidates:
+            print(f"NO HAY nada para publicar para {acc.key}.")
             continue
 
-        # Publicar en orden
-        for i, (wutc, row, dedupe_key) in enumerate(candidates, start=1):
+        publicados = 0
+        for row, wutc in candidates:
+            if publicados >= MAX_PER_RUN:
+                print(f"LÍMITE alcanzado (MAX_PER_RUN={MAX_PER_RUN}) para {acc.key}")
+                break
+
+            # Texto / alt
             txt_key, alt_key = f"texto_{acc.lang}", f"alt_{acc.lang}"
             text = (row.get(txt_key) or "").strip()
+            alt  = (row.get(alt_key) or "").strip()
 
-            # Hilo (opcional)
+            # DEDUPE por seguridad (puede haber cambiado posted en disco si otro job corrió)
+            dkey = dedupe_key_for_timestamp(acc.key, wutc)
+            if (dkey, acc.key) in posted_set:
+                print(f"SKIP (dedupe-ts) {dkey} ya publicado por {acc.key}")
+                continue
+
+            # Reply al hilo si existe
             thread_key = (row.get("thread") or "").strip()
             reply_to_id = threads.get(f"{acc.key}:{thread_key}") if thread_key else None
 
-            # Imagen (opcional)
+            # Imagen opcional (1)
             media_id = None
             img = (row.get("imagen") or "").strip()
             if img:
                 try:
                     b, mime = get_bytes(img)
                     media_id = upload_media_v2(access_token, b, mime)
-                    set_media_alt_text(access_token, media_id, row.get(alt_key,""))
+                    set_media_alt_text(access_token, media_id, alt)
                 except Exception as e:
                     print(f"MEDIA ERROR -> solo texto: {e}")
 
@@ -447,22 +454,18 @@ def main() -> None:
                 resp = post_tweet_v2(access_token, text, media_id, reply_to=reply_to_id)
                 tweet_id = resp.get("data",{}).get("id")
                 print(f"publicado (oauth2) {acc.key}: tweet_id={tweet_id} cuando_utc={wutc.isoformat()}")
-
                 if thread_key and tweet_id:
                     threads[f"{acc.key}:{thread_key}"] = tweet_id
-
-                append_posted(state_file, dedupe_key, acc.key, tweet_id or "", text)
-                posted.add((dedupe_key, acc.key))
-                last_times[acc.key] = now_utc()
-
+                append_posted(state_file, dkey, acc.key, tweet_id or "", text)
+                posted_set.add((dkey, acc.key))
+                last_by_acc[acc.key] = now_utc()
+                publicados += 1
             except Exception as e:
                 print(f"TWEET ERROR {acc.key}: {e}")
-
-            # Si esta corrida va a publicar más de uno por cuenta, pausá entre ellos
-            if i < len(candidates):
-                time.sleep(PAUSE_BETWEEN_POSTS_SEC)
+                # Si falla, no marcamos posted y seguimos al siguiente candidato
 
     save_threads(THREAD_FILE, threads)
+
 
 if __name__ == "__main__":
     main()
