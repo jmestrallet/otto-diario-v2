@@ -2,7 +2,7 @@ name: X scheduler
 
 on:
   schedule:
-    - cron: "0 * * * *"           # corre al minuto 0 de cada hora
+    - cron: "0 */3 * * *"   # corre al minuto 0 de cada 3 hora
   workflow_dispatch:
 
 permissions:
