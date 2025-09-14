@@ -58,6 +58,9 @@ jobs:
           MIN_GAP_MIN:     ${{ vars.MIN_GAP_MIN }}
           MAX_PER_RUN:     ${{ vars.MAX_PER_RUN }}
           STRICT_CHRONO:   ${{ vars.STRICT_CHRONO }}
+          # NUEVO (opcional; default ya es 1)
+          ATOMIC_ACCOUNTS: ${{ vars.ATOMIC_ACCOUNTS || '1' }}
+          REQUIRE_MEDIA_OK: ${{ vars.REQUIRE_MEDIA_OK || '1' }}
         run: |
           python post_scheduler.py
 
