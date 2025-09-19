@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 from __future__ import annotations
-import csv, json, os, sys, time, mimetypes, requests, re, math
+import csv, json, os, sys, time, mimetypes, requests, re
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -104,6 +104,15 @@ def get_bytes(path_or_url: str, timeout: int = 60):
         data = f.read()
     return data, detect_mime(path_or_url, data)
 
+def _log_headers(prefix: str, headers: Dict[str, str]) -> None:
+    keys = [
+        "x-request-id", "x-client-transaction-id", "x-response-time",
+        "x-rate-limit-limit", "x-rate-limit-remaining", "x-rate-limit-reset"
+    ]
+    snippet = {k: headers.get(k) for k in keys if k in headers}
+    if snippet:
+        print(f"{prefix} HEADERS: {snippet}")
+
 def refresh_access_token(client_id: str, refresh_token: str) -> dict:
     data = {"grant_type":"refresh_token","refresh_token":refresh_token,"client_id":client_id}
     r = requests.post(OAUTH_TOKEN_URL, data=data, headers={"Content-Type":"application/x-www-form-urlencoded"}, timeout=30)
@@ -113,7 +122,9 @@ def refresh_access_token(client_id: str, refresh_token: str) -> dict:
         j = {"error": r.text[:200]}
     print(f"TOKEN STATUS: {r.status_code} expires_in={j.get('expires_in')} token_type={j.get('token_type')}")
     if "scope" in j: print(f"SCOPES: {j['scope']}")
-    if r.status_code >= 400: raise RuntimeError(f"refresh_access_token failed: {j}")
+    if r.status_code >= 400:
+        _log_headers("TOKEN ERROR", r.headers)
+        raise RuntimeError(f"refresh_access_token failed: {j}")
     return j
 
 def save_rotating_token(acc_key: str, new_rt: str):
@@ -147,6 +158,7 @@ def get_me(access_token: str, max_retries: int = 3, base_wait: int = 5) -> dict:
             if u: print(f"ME: id={u.get('id')} username=@{u.get('username')}")
             else: print("ME: (sin data)")
             return u
+        _log_headers("/2/users/me ERROR", r.headers)
         if r.status_code == 429 or r.status_code >= 500:
             wait = _retry_wait(r.headers, attempt, base_wait)
             print(f"/2/users/me {r.status_code} -> retry {attempt}/{max_retries} en {wait}s ; resp={j}")
@@ -165,7 +177,9 @@ def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str, max_
     try: j1 = r1.json()
     except Exception: j1 = {"error": r1.text[:200]}
     print("MEDIA INIT", r1.status_code, j1)
-    if r1.status_code >= 400: raise RuntimeError(f"MEDIA INIT error: {j1}")
+    if r1.status_code >= 400:
+        _log_headers("MEDIA INIT ERROR", r1.headers)
+        raise RuntimeError(f"MEDIA INIT error: {j1}")
     media_id = j1.get("data",{}).get("id") or j1.get("media_id_string") or j1.get("media_id")
     if not media_id: raise RuntimeError(f"MEDIA INIT missing id: {j1}")
 
@@ -178,6 +192,7 @@ def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str, max_
     if r2.status_code >= 400:
         try: jj = r2.json()
         except Exception: jj = {"error": r2.text[:200]}
+        _log_headers("MEDIA APPEND ERROR", r2.headers)
         raise RuntimeError(f"MEDIA APPEND error: {jj}")
 
     # FINALIZE
@@ -186,21 +201,28 @@ def upload_media_v2(access_token: str, media_bytes: bytes, media_type: str, max_
     try: j3 = r3.json()
     except Exception: j3 = {"error": r3.text[:200]}
     print("MEDIA FINALIZE", r3.status_code, j3)
-    if r3.status_code >= 400: raise RuntimeError(f"MEDIA FINALIZE error: {j3}")
+    if r3.status_code >= 400:
+        _log_headers("MEDIA FINALIZE ERROR", r3.headers)
+        raise RuntimeError(f"MEDIA FINALIZE error: {j3}")
 
-    # STATUS
+    # STATUS (ocasional en imágenes)
     proc = j3.get("data", {}).get("processing_info") or j3.get("processing_info")
-    # (imágenes suelen no tener procesamiento; si lo tienen, hacemos poll corto)
     tries = 0
     while proc and proc.get("state") in ("pending","in_progress") and tries < 5:
         wait = max(1, int(proc.get("check_after_secs", 1)))
         time.sleep(min(wait, 5))
-        st = requests.get(MEDIA_STATUS_URL,
-                          headers={"Authorization": f"Bearer {access_token}"},
-                          params={"command":"STATUS","media_id":str(media_id)}, timeout=30).json()
+        st_r = requests.get(MEDIA_STATUS_URL,
+                            headers={"Authorization": f"Bearer {access_token}"},
+                            params={"command":"STATUS","media_id":str(media_id)}, timeout=30)
+        try:
+            st = st_r.json()
+        except Exception:
+            st = {"raw": st_r.text[:200]}
         print("MEDIA STATUS", st)
         proc = st.get("data", {}).get("processing_info") or st.get("processing_info") or {}
-        if proc.get("state") == "failed": raise RuntimeError(f"MEDIA STATUS failed: {st}")
+        if proc.get("state") == "failed":
+            _log_headers("MEDIA STATUS ERROR", st_r.headers)
+            raise RuntimeError(f"MEDIA STATUS failed: {st}")
         tries += 1
     return str(media_id)
 
@@ -212,6 +234,7 @@ def set_media_alt_text(access_token: str, media_id: str, alt_text: str) -> None:
                       headers={"Authorization": f"Bearer {access_token}","Content-Type":"application/json"},
                       json=payload, timeout=30)
     if r.status_code >= 400:
+        _log_headers("ALT WARN", r.headers)
         try: print(f"ALT WARN: {r.status_code} {r.json()}")
         except Exception: print(f"ALT WARN: {r.status_code} {r.text[:200]}")
 
@@ -228,6 +251,7 @@ def post_tweet_v2_retry(access_token: str, text: str, media_id: Optional[str] = 
         except Exception: j = {"raw": r.text[:200]}
         if r.status_code < 400:
             return j
+        _log_headers("/2/tweets ERROR", r.headers)
         if r.status_code == 429 or r.status_code >= 500:
             wait = _retry_wait(r.headers, attempt, 5)
             print(f"/2/tweets {r.status_code} -> retry {attempt}/{max_retries} en {wait}s ; resp={j}")
@@ -247,18 +271,15 @@ def save_threads(path: str, data: dict) -> None:
         json.dump(data, f, ensure_ascii=False)
 
 # ========= Selección de candidatos / Flags =========
-CATCH_UP       = int(env("CATCH_UP", "1"))       # 1=permitir atrasados
-LOOKBACK_DAYS  = int(env("LOOKBACK_DAYS", "14")) # ventana de búsqueda hacia atrás
-WINDOW_MIN     = int(env("WINDOW_MIN", "30"))    # ventana "on-time"
-MIN_GAP_MIN    = int(env("MIN_GAP_MIN", "60"))   # separación mínima entre posts por cuenta
-MAX_PER_RUN    = int(env("MAX_PER_RUN", "1"))    # máximo por corrida, por cuenta
-STRICT_CHRONO  = int(env("STRICT_CHRONO", "1"))  # 1=no saltar días si hay atrasados
-ATOMIC_PREFLIGHT = int(env("ATOMIC_PREFLIGHT", "1")) # 1=sube imagen a TODAS antes de postear
+CATCH_UP       = int(env("CATCH_UP", "1"))        # 1=permitir atrasados
+LOOKBACK_DAYS  = int(env("LOOKBACK_DAYS", "14"))  # ventana hacia atrás
+WINDOW_MIN     = int(env("WINDOW_MIN", "30"))     # ventana "on-time"
+MAX_PER_RUN    = int(env("MAX_PER_RUN", "1"))     # máximo por corrida, por cuenta
 
-def last_post_time_for(acc_key: str, posted: set[Tuple[str,str]]) -> Optional[datetime]:
-    # no tenemos timestamps por cuenta en posted.csv, así que aproximamos por el más reciente en archivo
-    # (suficiente para throttle de MIN_GAP_MIN durante una corrida)
-    return None
+STRICT_CHRONO  = int(env("STRICT_CHRONO", "1"))   # 1=no saltar días si hay atrasados
+# Aceptar ambos nombres de flag para atomicidad:
+ATOMIC_PREFLIGHT = int(env("ATOMIC_PREFLIGHT", env("ATOMIC_ACCOUNTS", "1")))
+REQUIRE_MEDIA_OK = int(env("REQUIRE_MEDIA_OK", "1"))
 
 def eligible_rows(rows: List[dict], posted: set[Tuple[str,str]], acc_key: str) -> List[dict]:
     """Filtra filas elegibles para una cuenta: por ventana o catch-up + dedupe."""
@@ -270,7 +291,7 @@ def eligible_rows(rows: List[dict], posted: set[Tuple[str,str]], acc_key: str) -
             wutc = when_utc_from_row(r["fecha"], r["hora_MVD"])
         except Exception:
             continue
-        if wutc < earliest: 
+        if wutc < earliest:
             continue
         dkey = dedupe_key_for_timestamp(acc_key, wutc)
         if (dkey, acc_key) in posted:
@@ -281,20 +302,19 @@ def eligible_rows(rows: List[dict], posted: set[Tuple[str,str]], acc_key: str) -
             if in_window(wutc, WINDOW_MIN): out.append(r)
     # Orden cronológico ascendente
     out.sort(key=lambda rr: when_utc_from_row(rr["fecha"], rr["hora_MVD"]))
-    return out
+    # Respetar MAX_PER_RUN a nivel selección (blando; la atomicidad igual manda)
+    return out[:max(1, MAX_PER_RUN)]
 
 def pick_common_row(per_acc_candidates: Dict[str, List[dict]]) -> Optional[dict]:
     """Elige la primera fila (cronológica) que exista para TODAS las cuentas (mismo fecha/hora)."""
     if not per_acc_candidates: return None
-    # index por (fecha,hora)
     sets = []
-    for acc_key, lst in per_acc_candidates.items():
+    for lst in per_acc_candidates.values():
         s = {(r["fecha"], r["hora_MVD"]) for r in lst}
         sets.append(s)
     common = set.intersection(*sets) if sets else set()
     if not common: return None
     fecha, hora = sorted(common)[0]  # la más vieja
-    # Devolver un dict "representativo" (los textos difieren por idioma, pero fecha/hora/img/thread iguales)
     for lst in per_acc_candidates.values():
         for r in lst:
             if r["fecha"] == fecha and r["hora_MVD"] == hora:
@@ -323,9 +343,13 @@ def main() -> None:
         rows = [parse_csv_row(r) for r in csv.DictReader(f)]
     threads = load_threads(THREAD_FILE)
 
-    # 1) Auth de TODAS + throttle check
+    # 0) Orden de publicación deseado: ACC2 -> ACC3 -> ACC1
+    publish_order = ["ACC2", "ACC3", "ACC1"]
+    accounts_sorted = sorted(accounts, key=lambda a: publish_order.index(a.key) if a.key in publish_order else 999)
+
+    # 1) Auth de TODAS
     access: Dict[str,str] = {}
-    for acc in accounts:
+    for acc in accounts_sorted:
         print(f"\n=== {acc.key} ({acc.lang}) ===")
         try:
             tok = refresh_access_token(client_id, acc.refresh_token)
@@ -340,8 +364,8 @@ def main() -> None:
             return
 
     # 2) Candidatos por cuenta
-    per_acc: Dict[str, List[dict]] = {acc.key: eligible_rows(rows, posted, acc.key) for acc in accounts}
-    for acc in accounts:
+    per_acc: Dict[str, List[dict]] = {acc.key: eligible_rows(rows, posted, acc.key) for acc in accounts_sorted}
+    for acc in accounts_sorted:
         print(f"CANDIDATOS {acc.key}: {len(per_acc[acc.key])} (catch_up={CATCH_UP}, lookback_days={LOOKBACK_DAYS}, window_min={WINDOW_MIN})")
 
     # 3) Elegir una fila común (misma fecha/hora) para TODAS
@@ -349,20 +373,16 @@ def main() -> None:
     if not row:
         print("NO HAY nada común para publicar en TODAS las cuentas."); return
 
-    # 4) Chequeo STRICT_CHRONO: si hay algo más viejo pendiente, no saltear
+    # 4) STRICT_CHRONO: no saltear si hay más viejo pendiente en alguna
     if STRICT_CHRONO:
-        n = now_utc()
         target_utc = when_utc_from_row(row["fecha"], row["hora_MVD"])
-        for acc in accounts:
+        for acc in accounts_sorted:
             older = [r for r in per_acc[acc.key] if when_utc_from_row(r["fecha"], r["hora_MVD"]) < target_utc]
             if older:
                 print(f"STRICT_CHRONO: {acc.key} tiene más viejo pendiente -> se respeta el orden (no se publica aún).")
                 return
 
-    # 5) Throttle MIN_GAP_MIN (usa timestamps de posted.csv si los llevás por fuera; aquí omitimos por simplicidad)
-    #    Si querés un throttle real por cuenta, guardá también el posted_at por cuenta y léelo aquí.
-
-    # 6) Prefetch bytes de imagen UNA sola vez (si hay)
+    # 5) Cargar imagen una sola vez
     img_path = (row.get("imagen") or "").strip()
     img_bytes, img_mime = (None, None)
     if img_path:
@@ -370,13 +390,16 @@ def main() -> None:
             img_bytes, img_mime = get_bytes(img_path)
         except Exception as e:
             print(f"MEDIA READ ERROR: {e}")
-            print("ABORT: no se publica en ninguna cuenta (imagen inválida).")
-            return
+            if REQUIRE_MEDIA_OK:
+                print("ABORT: no se publica en ninguna cuenta (imagen inválida).")
+                return
+            else:
+                print("WARN: imagen inválida; se continuará solo con texto.")
 
-    # 7) ATOMIC_PREFLIGHT: subir imagen (y ALT) a TODAS antes de postear. Si una falla, aborta todo.
+    # 6) ATOMIC_PREFLIGHT: subir imagen (y ALT) a TODAS antes de postear. Si una falla, aborta todo.
     media_ids: Dict[str,str] = {}
     if ATOMIC_PREFLIGHT and img_bytes:
-        for acc in accounts:
+        for acc in accounts_sorted:
             alt_key = f"alt_{acc.lang}"
             try:
                 mid = upload_media_v2(access[acc.key], img_bytes, img_mime)
@@ -387,18 +410,18 @@ def main() -> None:
                 print("ABORT: preflight de media falló en una cuenta -> no se publica nada.")
                 return
 
-    # 8) Publicar en TODAS (sin rollback), commit de estado SOLO al final si todas OK
+    # 7) Publicar en TODAS (sin rollback), commit de estado SOLO al final si todas OK
     to_append: List[Tuple[str,str,str,str]] = []
     new_threads = threads.copy()
     try:
-        count_done = 0
-        for acc in accounts:
-            txt_key, alt_key = f"texto_{acc.lang}", f"alt_{acc.lang}"
+        for idx, acc in enumerate(accounts_sorted):
+            txt_key = f"texto_{acc.lang}"
             text = (row.get(txt_key) or "").strip()
             if not text:
                 raise RuntimeError(f"Sin texto para {acc.key}/{acc.lang}")
             wutc = when_utc_from_row(row["fecha"], row["hora_MVD"])
             dkey = dedupe_key_for_timestamp(acc.key, wutc)
+
             # reply a hilo si corresponde
             thread_key = (row.get("thread") or "").strip()
             reply_to_id = new_threads.get(f"{acc.key}:{thread_key}") if thread_key else None
@@ -411,7 +434,10 @@ def main() -> None:
             if thread_key and tid:
                 new_threads[f"{acc.key}:{thread_key}"] = tid
             to_append.append((dkey, acc.key, tid, text))
-            count_done += 1
+
+            # separador corto entre cuentas (2s)
+            if idx < len(accounts_sorted) - 1:
+                time.sleep(2)
 
         # si TODAS publicaron, recién ahí persistimos
         append_posted_batch(state_file, to_append)
